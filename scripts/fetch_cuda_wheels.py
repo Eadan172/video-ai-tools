@@ -13,9 +13,12 @@
   * 全部落在指定目录，不污染 C 盘（pip 默认会把大 wheel 先下到 %TEMP%）。
 
 用法：
-    python scripts/fetch_cuda_wheels.py --dest D:/pip-wheels
-    python scripts/fetch_cuda_wheels.py --dest D:/pip-wheels --cuda-index cu126
+    python scripts/fetch_cuda_wheels.py
+    python scripts/fetch_cuda_wheels.py --dest <目录> --cuda-index cu126
     python scripts/fetch_cuda_wheels.py --probe-only
+
+--dest 默认 ./tools/wheels（相对仓库根解析），也可传绝对路径。
+默认目录已落在仓库内，因此不依赖任何机器上的固定盘符。
 """
 
 from __future__ import annotations
@@ -43,6 +46,10 @@ WHEEL_TEMPLATES: list[tuple[str, str]] = [
 ]
 
 CHUNK = 1 << 20  # 1 MiB
+
+#: 仓库根目录（scripts/ 的上一级）。相对路径一律以此为基准解析，
+#: 避免把开发机上的盘符写进代码。
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _head(url: str, timeout: float = 20) -> int | None:
@@ -155,8 +162,9 @@ def download(url: str, dest: Path, label: str) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="下载 PyTorch CUDA 轮子")
-    ap.add_argument("--dest", default="D:/pip-wheels",
-                    help="轮子存放目录（默认 D:/pip-wheels，避免占用 C 盘）")
+    ap.add_argument("--dest", default="./tools/wheels",
+                    help="轮子存放目录，相对路径以仓库根为基准"
+                         "（默认 ./tools/wheels）")
     ap.add_argument("--cuda-index", default="cu128",
                     help="CUDA 构建标签：cu128 / cu126 / cu118（默认 cu128）")
     ap.add_argument("--torch-ver", default="2.7.0", help="torch 版本")
@@ -170,6 +178,8 @@ def main() -> int:
 
     socket.setdefaulttimeout(60)
     dest = Path(args.dest)
+    if not dest.is_absolute():          # 相对仓库根解析，与调用时的工作目录无关
+        dest = REPO_ROOT / dest
     ctx = {"cu": args.cuda_index, "torch": args.torch_ver,
            "tv": args.tv_ver, "py": args.py_tag}
 

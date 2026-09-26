@@ -35,7 +35,7 @@
 .PARAMETER PipCacheDir
     pip 下载缓存与下载临时目录。默认放在**项目同级目录**的 .pip-cache，
     避免 CUDA 轮子（单个 3.3 GB）把 C 盘临时空间吃掉。
-    传空字符串外的路径可自定义，例如 D:\pip-cache。
+    传空字符串外的路径可自定义（建议放在空间较大的盘，避免占用系统盘）。
 
 .PARAMETER RveVersion
     REAL-Video-Enhancer 版本，默认 2.4.1。
@@ -108,15 +108,24 @@ function Ok($msg)   { Write-Host "  [OK] $msg"   -ForegroundColor Green }
 function Warn($msg) { Write-Host "  [!]  $msg"   -ForegroundColor Yellow }
 
 function Get-Python {
-    # 优先 PATH 上的 python，其次常见 conda/系统位置
-    $c = Get-Command python -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
-    foreach ($p in @(
-        "$env:USERPROFILE\.workbuddy\binaries\python\versions\3.13.12\python.exe",
-        "D:\anaconda\python.exe",
-        "C:\Python311\python.exe"
-    )) { if (Test-Path $p) { return $p } }
-    throw "未找到 python，请先安装 Python 3.11 并加入 PATH"
+    # 依次尝试：PATH 上的解释器 → 由环境变量推导的常见安装位置。
+    # 这里刻意不写死任何盘符或版本号，换机器无需改脚本。
+    foreach ($name in @("python", "python3", "py")) {
+        $c = Get-Command $name -ErrorAction SilentlyContinue
+        if ($c) { return $c.Source }
+    }
+    $cands = @()
+    if ($env:USERPROFILE) {
+        $cands += Get-ChildItem `
+            "$env:USERPROFILE\.workbuddy\binaries\python\versions\*\python.exe" `
+            -ErrorAction SilentlyContinue
+    }
+    if ($env:LOCALAPPDATA) {
+        $cands += Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" `
+            -ErrorAction SilentlyContinue
+    }
+    foreach ($c in $cands) { if ($c) { return $c.FullName } }
+    throw "未找到 python，请先安装 Python 3.11 并加入 PATH，然后重跑本脚本"
 }
 
 function New-Venv($path, $python) {

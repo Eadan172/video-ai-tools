@@ -1,14 +1,13 @@
 # Video Pipeline — 单机无人值守批量视频处理系统
 
-面向 50+ 网课视频的批量「修复 → 转格式 → 导出」流水线，为以下硬件基准设计：
+面向 50+ 网课视频的批量「修复 → 转格式 → 导出」流水线，主要参数基准：
 
-| 资源 | 基准 | 角色 |
-| --- | --- | --- |
-| CPU | 22 核 | FFmpeg 辅助 / 调度 / DeepFilterNet 音频降噪 |
-| RAM | 16GB | 严格限制并发，>80% 禁止启动新阶段 |
-| GPU 1 | RTX 4060 8GB | 唯一视频 AI 推理卡（REAL-Video-Enhancer / TensorRT） |
-| GPU 2 | Intel Arc 8GB | 优先 QSV 硬件编码 |
-| 磁盘 | **50GB 可用** | **第一优先级调度约束** |
+| 资源 | 参数 |
+| --- | --- |
+| CPU | 22 核 |
+| RAM | 16GB（严格限制并发，超限禁止启动新阶段） |
+| GPU | 8GB 显存（视频 AI 推理）+ 支持 QSV 的集显（硬件编码） |
+| 磁盘 | 50GB 可用（第一优先级调度约束） |
 
 核心原则：**稳定性 > 吞吐量**。同一时间只有一个视频进入完整工作区
 （`work/current/`），断点续跑、失败隔离、磁盘保护、原子输出。
@@ -131,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_ai_tools.ps1 -Cuda
 | 工具 | 用途 | 必需性 |
 | --- | --- | --- |
 | FFmpeg / FFprobe | 解码、转码、合流、探测 | **必需** |
-| REAL-Video-Enhancer | 视频 AI 修复（RTX 4060） | 可选；缺失时 `--no-ai` 降级为纯转码 |
+| REAL-Video-Enhancer | 视频 AI 修复（NVIDIA GPU） | 可选；缺失时 `--no-ai` 降级为纯转码 |
 | DeepFilterNet | CPU 音频降噪 | 可选；同上 |
 
 > 两个 AI 组件必须装在**两个独立虚拟环境**里：RVE 需要 `numpy 2.x`，
@@ -274,7 +273,7 @@ python main.py verify    # 用 ffprobe 校验 output/ 所有最终文件
 
 ```text
 ffprobe 校验 + 选择 profile（light/course_720/legacy）
-  → RTX 4060 视频 AI 修复（RVE：1x 压缩伪影修复 + 2x 超分，默认不插帧）
+  → NVIDIA GPU 视频 AI 修复（RVE：1x 压缩伪影修复 + 2x 超分，默认不插帧）
   → CPU DeepFilterNet 音频降噪（完成即删原始 WAV）
   → 智能判断：已是目标格式则跳过转码，否则 Intel QSV/NVENC/CPU 转码
   → FFmpeg 合流（-c:v copy，视频绝不二次编码）
@@ -384,7 +383,7 @@ video_repair:
 
 ## 性能实测与已知限制
 
-在 RTX 4060 Laptop 8GB + 16GB RAM 上实测（源 712×400 / 25fps / 68 分钟的剧集）：
+在 16GB RAM + 8GB 显存档位上实测（源 712×400 / 25fps / 68 分钟的剧集）：
 
 | 阶段 | 实测吞吐 | 整集(4088s)外推 |
 | --- | --- | --- |
@@ -417,11 +416,14 @@ DeepFilterNet 会把整个文件读成浮点数组，峰值内存远高于数据
 **已实现的修复**（`adapters/deepfilternet.py`，不改第三方包源码）：
 
 1. 超出「按下述上限与可用内存算出的单段时长」的音频**自动分段**：
-   逐段抽出 → 逐段跑 DFN → 段间 50ms 交叉淡化拼接 → **长度对齐回原始帧数**
+   逐段抽出 → 逐段跑 DFN → 段间 50ms 交叉淡化 → **长度对齐回原始帧数**
    （保证输出与源时长偏差 ≤ 2s，可通过校验）；
-2. **OOM 自校准**：若某次分段仍因内存不足失败，自动把段长对半降低后整体重试
+2. **拼接走流式写盘**：逐段读入、与上一段尾部交叉淡化后立即写出，
+   内存峰值只有「单段 + 一个重叠窗口」，不随总时长增长；先写 `.partial`
+   再原子改名，中途失败不会留下看似成品的残文件；
+3. **OOM 自校准**：若某次分段仍因内存不足失败，自动把段长对半降低后整体重试
    （直到 30 秒）。因此换机器、换后台负载都无需手工调参；
-3. 短音频（≤ 单段上限）仍走原来的一次性路径，行为不变。
+4. 短音频（≤ 单段上限）仍走原来的一次性路径，行为不变。
 
 相关配置（`config.yaml`）：
 
@@ -444,7 +446,7 @@ audio_repair:
 ## GPU 检查
 
 ```bash
-nvidia-smi              # 应看到 RTX 4060，VRAM 8192MB
+nvidia-smi              # 确认能看到你的 NVIDIA GPU 与显存容量
 python main.py doctor   # 会检查 VRAM 与 NVENC
 ```
 

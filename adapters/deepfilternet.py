@@ -37,6 +37,20 @@ log = logging.getLogger("adapters.audio")
 DEFAULT_ARGS_TEMPLATE = ["{input}", "--output-dir", "{output_dir}"]
 
 
+def _write_upto(fh, block, budget: int) -> int:
+    """往 SoundFile 写一段音频，但不超过 budget 帧（用于精确对齐源帧数）。
+
+    返回实际写出的帧数；budget 用尽后返回 0，调用方继续消费剩余分段即可。
+    """
+    if budget <= 0:
+        return 0
+    if len(block) > budget:
+        block = block[:budget]
+    if len(block):
+        fh.write(block)
+    return len(block)
+
+
 class DeepFilterNetAdapter:
     #: 单段最长秒数。越小越省内存，越大段边界越少（段边界靠交叉淡化消除接缝）
     DEFAULT_MAX_SEGMENT = 120.0
@@ -249,6 +263,8 @@ class DeepFilterNetAdapter:
         parts: list[Path] = []
         start = 0.0
         idx = 0
+        # 先写 .partial 再原子改名：中途失败不会留下一个"看起来像成品"的残文件
+        partial = dst_wav.with_name(dst_wav.name + ".partial")
         try:
             with sf.SoundFile(str(src_wav)) as fh:
                 while start < total - 1e-6:
@@ -271,36 +287,64 @@ class DeepFilterNetAdapter:
                     parts.append(found)
                     start += n / float(sr)
 
-            out = None
+            # 流式拼接：逐段读入 → 与上一段尾部做交叉淡化 → 立即写出。
+            # 内存峰值只有「单段 + 一个重叠窗口」，不随总时长增长。
+            # 若像以前那样一次性 np.concatenate 整集，68min 立体声会占用
+            # 4~5GB，可能在低内存机器上直接抛 MemoryError——那种失败发生在
+            # 本进程内，OOM 自校准（只兜子进程的 ExternalToolError）碰不到。
             ov = max(1, int(self.crossfade * sr))
-            for p in parts:
-                a, _ = sf.read(str(p), dtype="float32", always_2d=True)
-                if a.shape[1] != channels:          # 通道数兜底对齐
-                    if a.shape[1] > channels:
-                        a = a[:, :channels]
+            written = 0
+            pending: np.ndarray | None = None    # 上一段尚未写出的尾部
+            with sf.SoundFile(str(partial), mode="w", format="WAV",
+                              samplerate=sr, channels=channels,
+                              subtype="PCM_16") as out_fh:
+                for p in parts:
+                    a, _ = sf.read(str(p), dtype="float32", always_2d=True)
+                    if a.shape[1] != channels:      # 通道数兜底对齐
+                        if a.shape[1] > channels:
+                            a = a[:, :channels]
+                        else:
+                            a = np.tile(
+                                a, (1, channels // max(1, a.shape[1]) + 1)
+                            )[:, :channels]
+                    if pending is None:              # 首段：先留出尾部做重叠
+                        if len(a) > ov:
+                            written += _write_upto(out_fh, a[:-ov],
+                                                   frames - written)
+                            pending = a[-ov:]
+                        else:
+                            pending = a
+                        continue
+                    k = int(min(ov, len(pending), len(a)))
+                    if k > 0:
+                        ramp = np.linspace(0.0, 1.0, k, dtype="float32")[:, None]
+                        mixed = pending[-k:] * (1.0 - ramp) + a[:k] * ramp
+                        written += _write_upto(out_fh, mixed, frames - written)
+                    rest = a[k:]
+                    if len(rest) > ov:
+                        written += _write_upto(out_fh, rest[:-ov],
+                                               frames - written)
+                        pending = rest[-ov:]
                     else:
-                        a = np.tile(a, (1, channels // max(1, a.shape[1]) + 1))[:, :channels]
-                if out is None:
-                    out = a
-                    continue
-                k = int(min(ov, len(out), len(a)))
-                ramp = np.linspace(0.0, 1.0, k, dtype="float32")[:, None]
-                mixed = out[-k:] * (1.0 - ramp) + a[:k] * ramp
-                out = np.concatenate([out[:-k], mixed, a[k:]], axis=0)
+                        pending = rest
 
-            # 长度对齐到原始帧数：拼接与 DFN 的延时补偿都可能改变长度，
-            # 而校验器要求输出与源时长偏差 ≤ 2s
-            if len(out) > frames:
-                out = out[:frames]
-            elif len(out) < frames:
-                pad = np.zeros((frames - len(out), out.shape[1]), dtype="float32")
-                out = np.concatenate([out, pad], axis=0)
+                if pending is not None and len(pending):
+                    written += _write_upto(out_fh, pending, frames - written)
 
-            sf.write(str(dst_wav), out, sr, subtype="PCM_16")
+                # 长度对齐到原始帧数：DFN 的延时补偿可能让总帧数少于源，
+                # 而校验器要求输出与源时长偏差 ≤ 2s
+                if written < frames:
+                    out_fh.write(np.zeros((frames - written, channels),
+                                          dtype="float32"))
+                    written = frames
+
+            partial.replace(dst_wav)
             log.info("分段拼接完成 → %s（%d 段，%.2f 分钟）",
-                     dst_wav.name, len(parts), len(out) / float(sr) / 60.0)
+                     dst_wav.name, len(parts), written / float(sr) / 60.0)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+            if partial.exists():
+                partial.unlink(missing_ok=True)
 
 
 class ClearerVoiceAdapter:
