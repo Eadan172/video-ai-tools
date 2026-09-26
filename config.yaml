@@ -1,0 +1,223 @@
+# =============================================================================
+# 单机无人值守批量视频处理系统 —— 配置
+# 基准硬件：CPU 22 核 / RAM 16GB / RTX 4060 8GB / Intel Arc 8GB / 磁盘 50GB
+#
+# 路径约定：本文件中以 ./ 或 ../ 开头的路径，一律相对于「本配置文件所在目录」
+#          解析为绝对路径（见 pipeline/config.py::Config.resolve_tools）。
+# =============================================================================
+
+paths:
+  input: "./input"
+  work: "./work"
+  output: "./output"
+  failed: "./failed"
+  logs: "./logs"
+  database: "./pipeline.db"
+
+# ---------------------------------------------------------------------------
+# 资源限制：16GB RAM，严禁通过大量并发换取吞吐
+# ---------------------------------------------------------------------------
+resources:
+  cpu_cores: 22
+  ram_total_gb: 16
+  # 注意：本机 16GB 内存的**基线占用约 85%**（系统 + 常驻应用），
+  # 原默认值 80/92 会导致 ram_allows_new_stage() 永远返回 False、
+  # 流水线在 _wait_resources 处死等到 600s 超时。
+  # 故按实际基线放宽；若换到内存更空闲的机器可再调回。
+  ram_soft_limit_percent: 92      # RAM 超过 92%：禁止启动新阶段
+  ram_hard_limit_percent: 97      # RAM 超过 97%：暂停/降级
+  max_video_ai_jobs: 1            # 绝不允许两个 AI 视频同时抢 RTX 4060
+  max_audio_jobs: 1
+  max_transcode_jobs: 1
+  monitor_interval_seconds: 15
+
+scheduler:
+  max_active_video_workspaces: 1  # 同一时间只有一个视频占用 work/current
+  poll_interval_seconds: 10
+
+# ---------------------------------------------------------------------------
+# 磁盘：50GB 可用，第一优先级调度约束
+# ---------------------------------------------------------------------------
+disk:
+  total_available_gb: 50
+  safe_start_gb: 30               # >= 30GB：允许启动新任务
+  pause_new_jobs_gb: 20           # 20~30GB：只继续当前任务
+  cleanup_gb: 15                  # 10~15GB：EMERGENCY_CLEANUP
+  emergency_stop_gb: 10           # < 10GB：停止流水线
+  safety_margin_gb: 8
+  video_temp_multiplier: 1.5      # 空间预估：源大小 × 1.5
+  audio_temp_multiplier: 0.2
+  output_multiplier: 1.2
+
+# ---------------------------------------------------------------------------
+# GPU：RTX 4060 只负责 AI 视频修复；Intel Arc 优先 QSV 编码
+# ---------------------------------------------------------------------------
+gpu:
+  ai_gpu:
+    type: "nvidia"
+    index: 0
+  encode_gpu:
+    type: "intel"
+    index: 1
+
+# ===========================================================================
+# 视频 AI 修复：REAL-Video-Enhancer 2.4.1（后端 CLI 直驱，绕开 GUI）
+#
+# 关键点：
+#   * RVE 的 Windows 发行版是 PyQt GUI；本流水线直接调用其推理后端
+#     `tools/backend/rve-backend.py`（标准 argparse CLI），实现无人值守。
+#   * RVE 的“放大倍率”由**模型文件**决定；此处通过 models.upscale 映射
+#     profile 给出的 scale（1/2/4）→ 对应模型路径。
+#   * args_template 中的 **列表项表示可选参数组**：组内任一占位符解析为空
+#     字符串时整组丢弃（例如 scale=1 时自动不传 --upscale_model）。
+#   * executable 是 RVE 专用解释器；torch/numpy 与 DeepFilterNet 冲突
+#     （RVE 需 numpy 2.x，DeepFilterNet 需 numpy<2），故必须独立环境。
+#
+# device 切换：
+#   device: cuda → 需 CUDA 版 torch（torch==2.7.0+cu128，本机已装）
+#                  实测 RTX 4060 Laptop：2 秒视频 16 秒跑完（CPU 需 365~552 秒，约 22~34x）
+#   device: cpu  → CPU 版 torch（torch==2.5.1+cpu）仅建议做功能验证
+#   安装：powershell -ExecutionPolicy Bypass -File scripts\setup_ai_tools.ps1 -Cuda
+#   自检：./.venv-rve/Scripts/python.exe scripts/verify_cuda.py --bench
+# ===========================================================================
+video_repair:
+  enabled: true
+  backend: "real-video-enhancer"  # real-video-enhancer | none
+  infer_backend: "pytorch"        # RVE 推理后端: pytorch | ncnn | tensorrt
+  device: "cuda"                  # cuda（需 CUDA 版 torch）| cpu
+  precision: "auto"               # auto | float16 | float32
+  gpu_index: 0
+  model: "auto"
+  denoise: true
+  deblock: true                   # true → 传 --extra_restoration_models 做压缩修复
+  upscale: true
+  scale_mode: "auto"              # auto | 1x | 2x | 4x（不要盲目固定 4x）
+  interpolation: false            # 默认禁止插帧
+  tile: 0                         # 0=整帧推理（CUDA 下推荐，最快）。显存不足报 OOM 时改 512/256；
+                                  # CPU 模式务必设 128，否则会因内存耗尽崩溃（rc=3221225477）
+  crf: 16                         # RVE 内部编码质量
+  encoder: "libx264"              # RVE 中间产物编码器；CPU 下 libx264 明显快于 libx265
+  timeout_seconds: 90000          # 25h。实测整集(4088s)按 ~1.9 fps 需约 14.8h，
+                                  # 必须大于实际耗时，否则 RVE 会被当成超时失败
+                                  # （原值 43200=12h 会在跑到 ~80% 时被杀掉）
+  executable: "./.venv-rve/Scripts/python.exe"
+  args_template:
+    - "./tools/backend/rve-backend.py"
+    - "-i"
+    - "{input}"
+    - "-o"
+    - "{output}"
+    - ["--extra_restoration_models", "{decompress_model}"]
+    - ["--upscale_model", "{upscale_model}"]
+    - "--device"
+    - "{device}"
+    - "--backend"
+    - "{infer_backend}"
+    - "--precision"
+    - "{precision}"
+    - "--pytorch_gpu_id"
+    - "{gpu_index}"
+    - ["--tilesize", "{tile}"]
+    - ["--ffmpeg_path", "{ffmpeg_path}"]
+    - "--overwrite"
+    - "--crf"
+    - "{crf}"
+    - "--video_encoder_preset"
+    - "{encoder}"
+    - "--audio_encoder_preset"
+    - "aac"
+  models:
+    upscale:
+      "2x": "./tools/models/2x_OpenProteus_Compact_i2_70K.pth"
+      # "4x": "./tools/models/4xNomos8k_span_otf_medium.pth"   # 需先下载
+    decompress: "./tools/models/1xDeH264_realplksr.pth"
+  # RVE 内部调用 ffmpeg 时使用；./ 开头 → 相对于本配置文件目录解析
+  ffmpeg_path: "./.tools/ffmpeg/ffmpeg.exe"
+  extra_args: []
+
+# ===========================================================================
+# 音频 AI 修复：DeepFilterNet 0.5.6（CPU）
+#
+# 关键点：
+#   * 上游 `deepFilter` 用 DataLoader(num_workers=2) 启动子进程预取音频，
+#     在受限/无人值守环境会报 “DataLoader worker exited unexpectedly”。
+#     故此处经 tools/df_enhance_cli.py 以 num_workers=0 在主进程内运行
+#     （行为等价，不修改第三方包源码）。
+#   * 模型首跑自动从 GitHub 下载到用户缓存目录，无需手工准备。
+#   * 输出命名 <stem>_DeepFilterNet3.wav，适配器会自动重命名为 audio_clean.wav。
+# ===========================================================================
+audio_repair:
+  enabled: true
+  backend: "deepfilternet"        # deepfilternet | clearervoice | none
+  executable: "./.venv/Scripts/python.exe"
+  sample_rate: 48000
+  bitrate: "320k"
+  timeout_seconds: 14400
+  args_template:
+    - "./tools/df_enhance_cli.py"
+    - "{input}"
+    - "--output-dir"
+    - "{output_dir}"
+    - "--log-level"
+    - "error"
+  extra_args: []
+
+# ---------------------------------------------------------------------------
+# 目标交付格式：MP4 / H.265 / AAC 320k / 48kHz
+# ---------------------------------------------------------------------------
+output:
+  container: "mp4"
+  video_codec: "hevc"             # h264 | hevc | av1
+  audio_codec: "aac"
+  audio_bitrate: "320k"
+  sample_rate: 48000
+  keep_subtitles: true
+  keep_metadata: true
+
+# ---------------------------------------------------------------------------
+# 编码后端优先级：Intel QSV → NVIDIA NVENC → CPU
+# ---------------------------------------------------------------------------
+encoder:
+  prefer: ["qsv", "nvenc", "cpu"]
+  qsv_preset: "medium"
+  cpu_preset: "medium"
+  crf: 23
+
+retry:
+  max_attempts: 2                 # 不要无限重试
+  backoff_seconds: 30
+
+verify:
+  duration_tolerance_seconds: 2
+  require_video: true
+  require_audio: true
+  min_size_bytes: 10000
+
+# 默认禁止 FFV1+PCM 巨型无损中间文件；仅输入无法直接处理时按需生成
+intermediate:
+  lossless: false
+
+input:
+  extensions:
+    - ".mp4"
+    - ".avi"
+    - ".wmv"
+    - ".mkv"
+    - ".mov"
+    - ".flv"
+    - ".webm"
+    - ".mpg"
+    - ".mpeg"
+    - ".3gp"
+
+# ---------------------------------------------------------------------------
+# 处理策略：按分辨率自动选择，可按文件名覆盖
+#   light      >=1080p     ：不超分，轻度降噪
+#   course_720  720p 左右  ：2x 超分 + 轻度降噪
+#   legacy     <=480p/老容器：去压缩 + 降噪 + 2x
+# ---------------------------------------------------------------------------
+profiles:
+  auto_select: true
+  overrides: {}
+  # overrides:
+  #   "S01E04.mp4": "legacy"

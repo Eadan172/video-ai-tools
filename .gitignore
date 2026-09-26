@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# 虚拟环境与外部工具：体积大 / 可再生成，一律不进版本库
+#   .venv       DeepFilterNet（音频 AI，numpy<2）
+#   .venv-rve   REAL-Video-Enhancer 后端（视频 AI，numpy 2.x + torch）
+#   .tools      FFmpeg / FFprobe 静态构建
+#   tools/backend、tools/models  RVE 后端源码与模型权重（由 setup_ai_tools.ps1 下载）
+# ---------------------------------------------------------------------------
+.venv/
+.venv-rve/
+.tools/
+tools/backend/
+tools/models/
+tools/backend-*.tar.gz
+tools/models/*.tar.gz
+
+# ---------------------------------------------------------------------------
+# 运行产物：输入视频、输出产物、工作区、日志、数据库
+#   注意用 `dir/*` 而不是 `dir/`——否则 !dir/.gitkeep 无法被重新纳入
+# ---------------------------------------------------------------------------
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+failed/*
+!failed/.gitkeep
+logs/*
+!logs/.gitkeep
+work/*
+!work/.gitkeep
+
+pipeline.db
+pipeline.db-wal
+pipeline.db-shm
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# 临时文件 / 编辑器 / 系统
+# ---------------------------------------------------------------------------
+*.tmp
+*.partial
+*.mp4.partial
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# RVE 后端在自己的运行目录下生成的日志文件
+ffmpeg_log.txt

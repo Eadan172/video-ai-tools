@@ -1,0 +1,4 @@
+# Python 依赖（FFmpeg / REAL-Video-Enhancer / DeepFilterNet 为外部工具，见 README）
+PyYAML>=6.0
+psutil>=5.9
+pytest>=7.4
