@@ -283,6 +283,42 @@ ffprobe 校验 + 选择 profile（light/course_720/legacy）
   → 清空 work/current → 下一个视频
 ```
 
+## 修复档位（light / 中档 / 完全修复）
+
+用户可直接选择修复档位，不需要改任何模型开关。查看完整说明：
+
+```bash
+./.venv/Scripts/python.exe main.py tiers
+```
+
+| 档位 | 修复范围 | 修复深度 | 具体操作 | 68min 实测 |
+| --- | --- | --- | --- | --- |
+| `light` | 容器与编码；**不碰**画面/声音内容 | 表面：仅重新封装与编码规范化 | FFmpeg → HEVC + AAC 48k（QSV→NVENC→CPU 降级） | 约 5 分钟 |
+| `standard` 中档 | 画面分辨率/锐度 + 音轨噪声；不做压缩伪影修复 | 深度：2x 分辨率重建 + 时域/频域降噪 | RVE 2x 超分（SPAN）→ 抽 48k WAV → DeepFilterNet → HEVC | 约 1.5 小时 |
+| `full` 完全修复 | 压缩伪影 + 分辨率/锐度 + 音轨噪声，三者全开 | 完整重建：先修块效应/振铃，再重建分辨率，最后降噪 | RVE 1x(RealPLKSR) + 2x(SPAN) → DeepFilterNet → HEVC | 约 14.8 小时 |
+| `auto`（默认） | 由 planner 按片源特征 + 时间预算自动判定 | 自动在中档 / 完全修复间选 | 见下节「自动档位」 | 取决于片源 |
+
+三种选择方式：
+
+```bat
+:: 1) 命令行
+.\.venv\Scripts\python.exe main.py --tier standard scan
+.\.venv\Scripts\python.exe main.py --tier standard run
+
+:: 2) 双击 run.bat —— 会弹出档位菜单
+run.bat
+run.bat --tier full --only 剧集 --no-prompt
+
+:: 3) 改 config.yaml 的 video_repair.tier（长期默认）
+```
+
+档位与输出格式是两件独立的事：档位决定「做不做 AI、做到哪一步」，
+`--format` 决定容器与编码组合。二者可自由组合，例如
+`--tier light --format mkv`（只转封装到 mkv，不做 AI）。
+
+> `--no-ai` 是 `--tier light` 的等价写法。AI 组件缺失时，launcher 会自动
+> 把档位强制为 `light` 并告警——否则每个任务都会在 AI 阶段 FAILED_FINAL。
+
 ## 自动档位（批量长视频不必手改配置）
 
 画质修复有 **两档**，实测差 **9 倍**：
@@ -366,6 +402,34 @@ video_repair:
   2 秒片段 CPU 需 365~552s。
 - 编解码后端把结果编码成 `libx264` 再由流水线用 QSV 转 HEVC，
   比让 RVE 自己编 libx265 更快（libx265 在 CPU 上是主要瓶颈）。
+
+### DeepFilterNet 长音频内存问题（已修复：自动分段）
+
+DeepFilterNet 会把整个文件读成浮点数组，峰值内存远高于数据量本身。实测
+（16 GB 机器、空闲约 4 GB 时）：
+
+| 输入 | 数据量(float32) | 结果 |
+| --- | --- | --- |
+| 68min 整文件 | 1.57 GB | ❌ 单次分配 3.15 GB 失败 → `FAILED_FINAL` |
+| 600s 段 | 230 MB | ❌ 仍 OOM |
+| 60s 段 | 23 MB | ✅ 通过 |
+
+**已实现的修复**（`adapters/deepfilternet.py`，不改第三方包源码）：
+
+1. 超出「按下述上限与可用内存算出的单段时长」的音频**自动分段**：
+   逐段抽出 → 逐段跑 DFN → 段间 50ms 交叉淡化拼接 → **长度对齐回原始帧数**
+   （保证输出与源时长偏差 ≤ 2s，可通过校验）；
+2. **OOM 自校准**：若某次分段仍因内存不足失败，自动把段长对半降低后整体重试
+   （直到 30 秒）。因此换机器、换后台负载都无需手工调参；
+3. 短音频（≤ 单段上限）仍走原来的一次性路径，行为不变。
+
+相关配置（`config.yaml`）：
+
+```yaml
+audio_repair:
+  max_segment_seconds: 120    # 单段最长 2 分钟；调小更省内存、段边界更多
+  crossfade_seconds: 0.05     # 段间交叉淡化时长
+```
 
 ## 常见错误
 

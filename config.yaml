@@ -176,6 +176,15 @@ audio_repair:
   sample_rate: 48000
   bitrate: "320k"
   timeout_seconds: 14400
+  # ---- 长音频内存适配（重要）----
+  # DeepFilterNet 把整个文件读成浮点数组，峰值内存 ≈ 数据量的 3 倍：
+  # 68min 立体声 48kHz 需 ~3.15GB，在 16GB 机器上必然 OOM。
+  # 因此超过「按下述上限与可用内存算出的单段时长」的音频会自动分段处理，
+  # 段间做交叉淡化，最后拼接并把长度对齐回原始帧数。
+  max_segment_seconds: 120        # 单段最长 2 分钟（越小越省内存）
+  crossfade_seconds: 0.05         # 段间交叉淡化 50ms
+  # 若仍因内存不足失败，适配器会把段长自动对半降低后重试（直到 30 秒），
+  # 因此不需要按机器手工调参。
   args_template:
     - "./tools/df_enhance_cli.py"
     - "{input}"
