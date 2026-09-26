@@ -67,6 +67,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "video_repair": {
         "enabled": True,
         "backend": "real-video-enhancer",   # real-video-enhancer | none
+        # 修复档位：auto | light | standard | full（见下方 REPAIR_TIERS）
+        #   auto     交给 planner 按片源特征 + 时间预算自动选（默认）
+        #   light    仅转码，不做 AI
+        #   standard 2x AI 超分 + 音质降噪
+        #   full     1x 压缩伪影修复 + 2x 超分 + 音质降噪
+        "tier": "auto",
         "infer_backend": "pytorch",         # RVE 推理后端: pytorch | ncnn | tensorrt
         "device": "cuda",
         "precision": "auto",                # auto | float16 | float32
@@ -99,6 +105,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "--video_encoder_preset", "{encoder}",
             "--audio_encoder_preset", "copy_audio",
         ],
+        # ---- 自动档位：按片源特征 + 时间预算自动决定是否启用 1x 压缩修复 ----
+        # 实测 1x 压缩修复模型（RealPLKSR）比 2x 超分模型慢约 9 倍，
+        # 手工写死会在批量处理 30+ 长视频时做出跑几天的配置。
+        # 详见 pipeline/planner.py 的说明与标定数据。
+        "auto": {
+            "enabled": True,
+            #: 单次 run 允许的「画质 AI 总时长」预算，按队列长度分摊到每个文件
+            "total_budget_hours": 12,
+            #: 单帧成本标定（秒 / 百万像素 / 帧），换机器/换显卡可用
+            #: scripts/verify_cuda.py --bench 复标定后覆盖
+            "upscale_s_per_mp": 0.0465,
+            "decompress_s_per_mp": 1.64,
+            "job_overhead_seconds": 30,
+            "timeout_safety_factor": 3.0,
+            "timeout_floor_seconds": 14400,
+            "artifact_codecs": ["h264", "avc", "wmv3", "vc1", "msmpeg4v3",
+                                "mpeg4", "msmpeg4", "mpeg2video"],
+            "artifact_containers": ["asf", "wmv", "avi"],
+            "audio_realtime_factor": 10.0,
+        },
         # 模型文件（REAL-Video-Enhancer 的“倍率”由模型决定，而非 --scale）
         "models": {
             "upscale": {
@@ -183,6 +209,84 @@ CONTAINER_PROFILES: dict[str, dict[str, str]] = {
 
 #: 需要 `-movflags +faststart` 的容器（其余容器传该参数会报错）
 FASTSTART_CONTAINERS = {"mp4", "mov"}
+
+# --------------------------------------------------------------------------- #
+# 三档修复模块
+#
+# 档位只决定「做不做 AI / 做到哪一步」，不改变容器与编码（那由 --format 决定）。
+# 实测耗时以 68min / 712×400 片源为基准（本机 RTX 4060 Laptop）。
+# --------------------------------------------------------------------------- #
+REPAIR_TIERS: dict[str, dict[str, Any]] = {
+    "auto": {
+        "label": "自动",
+        "video_ai": None,            # None = 交给 planner 按片源与预算自动决定
+        "audio_ai": True,
+        "summary": "按片源特征与时间预算自动在「中档 / 完全修复」之间选择",
+        "est_hours_per_68min": "取决于片源与队列",
+        "scope": "由 planner 判定（片源编码/容器 + 时间预算）",
+        "depth": "自动：中档或完全修复",
+        "steps": "scan 后按队列长度分摊预算 → 逐任务决定是否启用 1x 压缩修复",
+    },
+    "light": {
+        "label": "light（仅转码）",
+        "video_ai": False,
+        "audio_ai": False,
+        "summary": "不做任何 AI 修复，只做容器/编码规范化",
+        "est_hours_per_68min": "约 5 分钟",
+        "scope": "全部输入文件；只处理容器与编码，不碰画面/声音内容",
+        "depth": "表面：仅重新封装与编码规范化，画质音质与源一致",
+        "steps": "FFmpeg 转码 → H.265/HEVC + AAC 48kHz（QSV→NVENC→CPU 降级）→ 合流 → 校验",
+    },
+    "standard": {
+        "label": "中档（2x AI 超分 + 音质降噪）",
+        "video_ai": True,            # True = 画质 AI 开启，但不做 1x 压缩修复
+        "audio_ai": True,
+        "summary": "分辨率重建 + 语音降噪，不做压缩伪影修复",
+        "est_hours_per_68min": "约 1.5 小时",
+        "scope": "视频画面（分辨率/锐度）+ 音轨（噪声）；不做压缩伪影修复",
+        "depth": "深度：2x 分辨率重建 + 时域/频域降噪，不重建编码损失的细节",
+        "steps": "REAL-Video-Enhancer 2x 超分（SPAN 模型，CUDA）→ FFmpeg 抽 48kHz WAV → "
+                 "DeepFilterNet 语音降噪 → HEVC 转码 → 合流 → 校验",
+    },
+    "full": {
+        "label": "完全修复（1x 压缩伪影修复 + 2x 超分 + 音质降噪）",
+        "video_ai": True,
+        "audio_ai": True,
+        "summary": "压缩伪影修复 + 分辨率重建 + 语音降噪，质量最好但最慢",
+        "est_hours_per_68min": "约 14.8 小时",
+        "scope": "视频画面（压缩伪影 + 分辨率/锐度）+ 音轨（噪声），三者全开",
+        "depth": "完整重建：先修 H.264/WMV 的块效应与振铃，再重建分辨率，最后降噪",
+        "steps": "REAL-Video-Enhancer 1x 去压缩伪影（RealPLKSR）→ 2x 超分（SPAN，CUDA）→ "
+                 "FFmpeg 抽 48kHz WAV → DeepFilterNet 语音降噪 → HEVC 转码 → 合流 → 校验",
+    },
+}
+
+
+def apply_repair_tier(cfg: "Config", tier: str) -> str:
+    """按用户指定的修复档位覆写配置，返回归一化后的档位名。
+
+    - light    → 关闭视频 AI 与音频 AI（只转码）
+    - standard → 开启两个 AI，但不启用 1x 压缩伪影修复（仅 2x 超分）
+    - full     → 开启两个 AI，并启用 1x 压缩伪影修复
+    - auto     → 不覆写，交由 pipeline/planner.py 自动决定
+    """
+    key = str(tier).strip().lower()
+    if key in ("", "auto"):
+        cfg.raw.setdefault("video_repair", {})["tier"] = "auto"
+        return "auto"
+    if key not in REPAIR_TIERS:
+        raise ConfigError(
+            f"未知修复档位 {tier!r}；可选：{', '.join(REPAIR_TIERS)}")
+    spec = REPAIR_TIERS[key]
+    vr = cfg.raw.setdefault("video_repair", {})
+    ar = cfg.raw.setdefault("audio_repair", {})
+    if spec["video_ai"] is None:
+        vr["enabled"] = True
+    else:
+        vr["enabled"] = bool(spec["video_ai"])
+    ar["enabled"] = bool(spec["audio_ai"])
+    vr["tier"] = key
+    return key
 
 
 def apply_output_format(cfg: "Config", fmt: str) -> str:

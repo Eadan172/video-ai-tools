@@ -82,6 +82,14 @@ gpu:
 # ===========================================================================
 video_repair:
   enabled: true
+  # ---- 修复档位（用户可直接选，不需要改模型开关）----
+  #   auto     自动：由 pipeline/planner.py 按片源特征 + 时间预算自动选（默认）
+  #   light    仅转码：不做任何 AI 修复，只规范化容器与编码
+  #   standard 中档：2x AI 超分 + DeepFilterNet 音质降噪（不做压缩伪影修复）
+  #   full     完全修复：1x 压缩伪影修复 + 2x 超分 + 音质降噪
+  # 三档的「修复范围 / 修复深度 / 具体操作」详见：python main.py tiers
+  # CLI 覆盖：python main.py --tier standard scan && python main.py --tier standard run
+  tier: "auto"
   backend: "real-video-enhancer"  # real-video-enhancer | none
   infer_backend: "pytorch"        # RVE 推理后端: pytorch | ncnn | tensorrt
   device: "cuda"                  # cuda（需 CUDA 版 torch）| cpu
@@ -97,9 +105,10 @@ video_repair:
                                   # CPU 模式务必设 128，否则会因内存耗尽崩溃（rc=3221225477）
   crf: 16                         # RVE 内部编码质量
   encoder: "libx264"              # RVE 中间产物编码器；CPU 下 libx264 明显快于 libx265
-  timeout_seconds: 90000          # 25h。实测整集(4088s)按 ~1.9 fps 需约 14.8h，
-                                  # 必须大于实际耗时，否则 RVE 会被当成超时失败
-                                  # （原值 43200=12h 会在跑到 ~80% 时被杀掉）
+  timeout_seconds: 14400          # 4h，仅作**兜底下限**。
+                                  # 实际值由 pipeline/planner.py 按「耗时预估 × 安全系数」
+                                  # 逐任务自动推导，不会再出现"改了档位忘了同步 timeout、
+                                  # 结果 RVE 被当成超时杀掉"的情况。
   executable: "./.venv-rve/Scripts/python.exe"
   args_template:
     - "./tools/backend/rve-backend.py"
@@ -126,10 +135,24 @@ video_repair:
     - "{encoder}"
     - "--audio_encoder_preset"
     - "aac"
+  # ---- 自动档位（建议保持 enabled: true，不要手工写死模型开关）----
+  # 实测：1x 压缩修复模型（RealPLKSR）比 2x 超分模型（SPAN）慢约 9 倍。
+  #   68min / 712x400 片源：完整档(1x+2x) 约 14.8h，快速档(仅2x) 约 1.5h，
+  #   音质 DeepFilterNet 约 7min。
+  # 因此流水线会自动决定是否启用压缩修复，判据两条：
+  #   1) 片源是否有压缩伪影特征（编码 h264/wmv3/mpeg4… 或容器 asf/wmv/avi）
+  #   2) 在「总预算 ÷ 队列长度」得到的单文件预算内，跑不跑得起完整档
+  # 队列越长 → 单文件预算越小 → 自动退回快速档，避免做出要跑几天的配置。
+  # 决策会写进 logs/jobs/<id>.log；开跑前可先看数：python main.py estimate
+  auto:
+    enabled: true
+    total_budget_hours: 12        # 单次 run 的画质 AI 总时长预算（按队列长度分摊）
   models:
     upscale:
       "2x": "./tools/models/2x_OpenProteus_Compact_i2_70K.pth"
       # "4x": "./tools/models/4xNomos8k_span_otf_medium.pth"   # 需先下载
+    # 1x 压缩伪影修复模型。填上即代表"具备该能力"，是否实际使用由 auto 决定；
+    # 想强制关闭可把 auto.enabled 设为 false 并把这里置为 null。
     decompress: "./tools/models/1xDeH264_realplksr.pth"
   # RVE 内部调用 ffmpeg 时使用；./ 开头 → 相对于本配置文件目录解析
   ffmpeg_path: "./.tools/ffmpeg/ffmpeg.exe"

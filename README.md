@@ -179,9 +179,12 @@ python main.py doctor
 ## 使用流程
 
 ```bash
-python main.py scan      # 1. 扫描 input/ 建立任务队列
-python main.py run       # 2. 无人值守运行
-python main.py status    # 3. 随时查看状态
+python main.py estimate   # 0. 先看批量要跑多久（只探测，不处理）
+python main.py scan       # 1. 扫描 input/ 建立任务队列
+python main.py run        # 2. 无人值守运行
+python main.py status     # 3. 随时查看状态
+python main.py verify     # 4. 校验 output/ 产物
+python main.py cleanup    # 5. 清理 work/ 临时文件
 ```
 
 全局参数（写在子命令**之前**）：
@@ -280,6 +283,69 @@ ffprobe 校验 + 选择 profile（light/course_720/legacy）
   → 清空 work/current → 下一个视频
 ```
 
+## 自动档位（批量长视频不必手改配置）
+
+画质修复有 **两档**，实测差 **9 倍**：
+
+| 档位 | 内容 | 68min/712×400 片源 |
+| --- | --- | --- |
+| 完整档 | 1x 压缩伪影修复 + 2x 超分 | 约 14.8 小时 |
+| 快速档 | 仅 2x 超分 | 约 1.5 小时 |
+
+因此在 `config.yaml` 里手工写死模型开关，批量处理 30+ 个长视频时极易做出
+一个要跑好几天、无人值守也收不了尾的配置。**本流水线改为自动决定**
+（`pipeline/planner.py`），判据两条：
+
+1. **片源值不值得修**：编码/容器是否含压缩伪影特征
+   （h264 / wmv3 / mpeg4 / vc1… 或 asf / wmv / avi 容器）；
+2. **时间上跑不跑得起**：单文件预算 = `auto.total_budget_hours ÷ 队列长度`。
+
+队列越长 → 单文件预算越小 → 自动退回快速档。决策会写进
+`logs/jobs/<id>.log`，同时**自动推导该任务的 RVE `timeout`**
+（预估 × 3，取下限 4h），不再有「改了档位忘了同步 timeout、RVE 被杀」的坑。
+
+**开跑前先看数**（只探测、不处理任何文件）：
+
+```bash
+./.venv/Scripts/python.exe main.py --only 剧集 estimate
+```
+
+输出示例（真实数据）：
+
+```text
+文件数            : 1
+总时长            : 1.1 小时
+单文件时间预算    : 12.00 小时（总预算 12.0h ÷ 1）
+画质 AI 完整档     : 14.8 小时（1x+2x）
+画质 AI 快速档     : 1.5 小时（仅 2x）
+自动档位          : 2x（仅超分）
+  理由：超预算：完整修复约 14.8h > 12.0h，退回 2x（约快 9 倍）
+```
+
+按此模型推算 30 个文件的批量（单帧成本在本机标定，误差 <3%）：
+
+| 片源 | 完整档 | 快速档 | 自动选定 |
+| --- | --- | --- | --- |
+| 30 × 35min @712×400 | 227.8 h | **23.4 h** | 快速档 |
+| 30 × 35min @720p（2x 超分） | 736.5 h | **75.2 h** | 快速档 |
+| 30 × 35min @1080p（light，不超分） | 1530.2 h | **42.4 h** | 快速档 |
+| 30 × 60min @1080p | 2623.1 h | **72.6 h** | 快速档 |
+
+> 1080p 反而比 720p 快，是因为 `light` 档不超分（输出仍是 1080p），
+> 而 `course_720` 档要 2x 超分（输出 1440p，像素数 ×4）。
+
+想固定行为也很简单：
+
+```yaml
+video_repair:
+  auto:
+    enabled: false        # 关掉自动 → 完全按 models 配置执行
+    total_budget_hours: 12
+```
+
+复标定（换显卡/换分辨率档位后）：`scripts/verify_cuda.py --bench`，
+把结果填回 `video_repair.auto.upscale_s_per_mp` / `decompress_s_per_mp`。
+
 ## 性能实测与已知限制
 
 在 RTX 4060 Laptop 8GB + 16GB RAM 上实测（源 712×400 / 25fps / 68 分钟的剧集）：
@@ -292,11 +358,10 @@ ffprobe 校验 + 选择 profile（light/course_720/legacy）
 
 结论与建议：
 
-- **瓶颈是压缩修复模型（RealPLKSR），比超分模型慢约 10 倍**。若只追求分辨率与锐度，
-  可把 `video_repair.models.decompress` 设为 `null`（或 `deblock: false`），
-  整集从 ~14.8h 降到 ~1.5h。
-- `video_repair.timeout_seconds` **必须大于实际耗时**（现为 90000s=25h）。
-  早期配置为 12h，会在跑到约 80% 时被当成超时杀掉。
+- **瓶颈是压缩修复模型（RealPLKSR），比超分模型慢约 10 倍**。是否启用由
+  上面的「自动档位」决定，不必手工改配置。
+- 成本模型的**分辨率线性外推是一阶近似**（只在 712×400 上标定过）。
+  1080p 那段估算偏保守，实际 CUDA 大分辨率下单位像素开销通常更低。
 - CPU 推理（`device: cpu`）比 CUDA 慢 20~50×，仅适合做功能验证：
   2 秒片段 CPU 需 365~552s。
 - 编解码后端把结果编码成 `libx264` 再由流水线用 QSV 转 HEVC，

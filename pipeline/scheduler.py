@@ -28,6 +28,7 @@ from .errors import (DependencyError, DiskSpaceError, EmergencyStopError,
                      GpuOutOfMemoryError, PipelineError, ProbeError)
 from .filename import unique_output_path
 from .logger import get_job_logger, job_log_path
+from .planner import RepairPlanner
 from .resources import ResourceMonitor
 from .state_machine import (Job, JobStatus, MediaInfo, PIPELINE_STAGES, Stage,
                             StageResult)
@@ -57,6 +58,12 @@ class Scheduler:
         self.audio_ai = build_audio_adapter(cfg.audio_repair)
         self.verifier = Verifier(self.ffprobe, cfg.verify, cfg.output)
 
+        # 自动档位：run() 里按队列规模创建（单文件预算 = 总预算 / 队列长度）
+        self.planner: RepairPlanner | None = None
+        # 逐任务覆盖前的原始值，用于恢复
+        self._orig_decompress_model = self.video_ai.decompress_model
+        self._orig_rve_timeout = self.video_ai.timeout
+
         self.max_workspaces = int(
             cfg.scheduler_opts.get("max_active_video_workspaces", 1))
         self.poll_interval = float(
@@ -75,6 +82,19 @@ class Scheduler:
         recovered = self.db.recover_interrupted()
         if recovered:
             log.info("恢复 %d 个被中断的任务", recovered)
+
+        # 自动档位：单文件时间预算 = 总预算 / 队列长度。
+        # 这样 30 个长视频的批次会自动退回快速档位，不会做出跑几天的配置。
+        counts = self.db.status_counts()
+        pending = sum(counts.get(s.value, 0) for s in (
+            JobStatus.DISCOVERED, JobStatus.WAITING, JobStatus.WAIT_RESOURCE,
+            JobStatus.WAIT_DISK, JobStatus.RUNNING, JobStatus.RETRY_PENDING))
+        self.planner = RepairPlanner(self.cfg.video_repair,
+                                     pending_jobs=max(1, pending))
+        log.info("自动档位：队列 %d 个任务，单文件画质 AI 预算 %.1fh，"
+                 "压缩修复能力 %s", pending,
+                 self.planner.budget_seconds / 3600,
+                 "可用" if self.planner.configured else "不可用")
         log.info("调度器启动：max_workspaces=%d", self.max_workspaces)
 
         while not self._stop_requested:
@@ -253,16 +273,25 @@ class Scheduler:
         if not vr_cfg.get("enabled", True) or vr_cfg.get("backend") == "none":
             # 不做视频 AI：直接用 FFmpeg 转一份高质量副本作为后续输入
             jlog.info("视频 AI 已禁用，直接转码为中间文件")
-            self.ffmpeg.transcode(Path(job.source_path), video_ai,
-                                  video_codec=self.cfg.output.get(
-                                      "video_codec", "hevc"),
-                                  sample_rate=self.cfg.output.get(
-                                      "sample_rate", 48000),
-                                  log_file=log_file)
+            self._transcode_intermediate(job, video_ai, log_file)
             self.db.set_stage_result(job.job_id, stage, StageResult.SKIPPED)
             return
 
         scale = profile.upscale_scale
+        # 自动档位：按片源特征 + 时间预算决定要不要开 1x 压缩修复，
+        # 并据此推导本任务的 RVE timeout（不再需要手工与档位同步）
+        decision = self._plan_repair(info, profile, jlog)
+        self._apply_repair_plan(decision, scale, jlog)
+
+        # 兜底：两个模型都不可用时不要硬跑 RVE（无模型会长时间无产出），
+        # 退化为纯转码，保证批量任务不会卡死
+        if not (self.video_ai.decompress_model
+                or self.video_ai.resolve_upscale_model(scale)):
+            jlog.warning("无可用 AI 模型（超分与压缩修复均不可用），退化为纯转码")
+            self._transcode_intermediate(job, video_ai, log_file)
+            self.db.set_stage_result(job.job_id, stage, StageResult.SKIPPED)
+            return
+
         try:
             self.video_ai.enhance(Path(job.source_path), video_ai,
                                   scale=scale, log_file=log_file)
@@ -278,6 +307,40 @@ class Scheduler:
         self.db.set_stage_result(job.job_id, stage, StageResult.DONE)
         jlog.info("%s 完成 → %s (%.2f GB)", stage.value, video_ai.name,
                   video_ai.stat().st_size / 1024 ** 3)
+
+    # ------------------------------------------------------------------ #
+    def _transcode_intermediate(self, job: Job, video_ai: Path,
+                                log_file: Path) -> None:
+        """不做视频 AI 时，用 FFmpeg 转一份高质量副本作为后续输入。"""
+        out = self.cfg.output
+        self.ffmpeg.transcode(Path(job.source_path), video_ai,
+                              video_codec=out.get("video_codec", "hevc"),
+                              sample_rate=out.get("sample_rate", 48000),
+                              log_file=log_file)
+
+    def _plan_repair(self, info: MediaInfo, profile: Profile, jlog):
+        """自动档位决策（片源特征 + 时间预算 → 是否启用 1x 压缩修复）。"""
+        if self.planner is None:
+            self.planner = RepairPlanner(self.cfg.video_repair, pending_jobs=1)
+        d = self.planner.decide(info, profile, quiet=True)
+        jlog.info("自动档位：%s —— %s", d.profile_name, d.reason)
+        jlog.info("耗时预估：完整档 %.2fh / 快速档 %.2fh / 单文件预算 %.2fh",
+                  d.est_full_seconds / 3600, d.est_fast_seconds / 3600,
+                  d.budget_seconds / 3600)
+        for w in d.warnings:
+            jlog.warning("自动档位提示：%s", w)
+        return d
+
+    def _apply_repair_plan(self, decision, scale: int, jlog) -> None:
+        """把决策落到 RVE 适配器上（单线程调度，逐任务覆盖后再恢复）。"""
+        use_up = bool(self.video_ai.resolve_upscale_model(scale))
+        self.video_ai.decompress_model = (
+            self._orig_decompress_model if decision.use_decompress else "")
+        self.video_ai.timeout = decision.timeout_seconds
+        jlog.info("RVE 参数：超分 %s，压缩修复 %s，timeout %.1fh",
+                  f"{scale}x" if use_up else "关",
+                  "开" if decision.use_decompress else "关",
+                  decision.timeout_seconds / 3600)
 
     def _stage_repair_audio(self, job: Job, info: MediaInfo, audio_wav: Path,
                             audio_clean: Path, log_file: Path, jlog) -> None:

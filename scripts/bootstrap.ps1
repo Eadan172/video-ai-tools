@@ -23,6 +23,7 @@ Set-Location $Root
 # --------------------------------------------------------------------- #
 $Format = ""
 $Only = ""
+$Tier = ""
 $ConfigFile = "config.yaml"
 $DryRun = $false
 $SelfTest = $false
@@ -46,6 +47,7 @@ while ($i -lt $RawArgs.Count) {
     switch ($key) {
         "format"    { if (-not $val) { $i++; $val = [string]$RawArgs[$i] }; $Format = $val }
         "only"      { if (-not $val) { $i++; $val = [string]$RawArgs[$i] }; $Only = $val }
+        "tier"      { if (-not $val) { $i++; $val = [string]$RawArgs[$i] }; $Tier = $val }
         "config"    { if (-not $val) { $i++; $val = [string]$RawArgs[$i] }; $ConfigFile = $val }
         "dry-run"   { $DryRun = $true }
         "dryrun"    { $DryRun = $true }
@@ -267,6 +269,42 @@ $Formats = @(
 )
 
 Step "5/6  处理选项"
+
+# ---- 修复档位（用户可选三档 + 自动）----
+$Tiers = @(
+    @("light",    "light     仅转码（最快，不做 AI）                  约 5 分钟/集"),
+    @("standard", "standard  中档：2x AI 超分 + 音质降噪            约 1.5 小时/集"),
+    @("full",     "full      完全修复：1x 压缩修复 + 2x 超分 + 音质    约 14.8 小时/集")
+)
+if (-not $Tier) {
+    if ($NoPrompt -or $DryRun -or $SelfTest) {
+        $Tier = "auto"
+    } else {
+        Write-Host "   请选择修复档位："
+        for ($n = 0; $n -lt $Tiers.Count; $n++) {
+            Write-Host ("      [{0}] {1}" -f ($n + 1), $Tiers[$n][1])
+        }
+        Write-Host "      [0] auto      自动（默认，按片源与队列预算在中档/完全修复间自动选）"
+        $sel = Read-Host "   输入序号后回车（直接回车 = auto）"
+        $sel = ([string]$sel).Trim()
+        if ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $Tiers.Count) {
+            $Tier = $Tiers[[int]$sel - 1][0]
+        } else {
+            $Tier = "auto"
+        }
+    }
+}
+if (@("auto", "light", "standard", "full") -notcontains $Tier.ToLower()) {
+    Warn "未知档位 '$Tier'，回退到 auto"
+    $Tier = "auto"
+}
+$Tier = $Tier.ToLower()
+if ($NoAI -and $Tier -ne "light") {
+    Warn "AI 组件不可用：档位由 $Tier 强制改为 light（仅转码），否则每个任务都会失败"
+    $Tier = "light"
+}
+Ok "修复档位：$Tier"
+
 if ($DryRun -or $SelfTest) {
     if (-not $Format) { $Format = "mp4" }
     Warn "本次为 --dry-run / --selftest，跳过交互选择（按 格式=$Format 演示）"
@@ -321,17 +359,16 @@ if (-not $DryRun -and -not $SelfTest) {
 # --------------------------------------------------------------------- #
 # 6. 执行
 # --------------------------------------------------------------------- #
-$commonArgs = @("--config=$ConfigFile", "--format=$Format")
+$commonArgs = @("--config=$ConfigFile", "--format=$Format", "--tier=$Tier")
 if ($Only) { $commonArgs += "--only=$Only" }
-if ($NoAI) { $commonArgs += "--no-ai" }
 
 if ($DryRun) {
     Step "6/6  环境检查完成（--dry-run，不执行处理）"
     Ok "Python      : $VenvPy"
     Ok "FFmpeg      : $FfDir"
     Ok "输出格式    : $Format"
+    Ok "修复档位    : $Tier"
     if ($Only) { Ok "处理范围    : input\$Only" } else { Ok "处理范围    : input\ 全部" }
-    if ($NoAI) { Ok "AI 修复     : 已禁用（纯转码）" } else { Ok "AI 修复     : 已启用" }
     Write-Host ""
     Write-Host "   将执行：" -ForegroundColor Cyan
     Write-Host ("     {0} main.py {1} scan" -f $VenvPy, ($commonArgs -join ' '))

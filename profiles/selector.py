@@ -45,8 +45,14 @@ def select_profile(info: MediaInfo, cfg: dict | None = None) -> Profile:
     height = info.height
     if height and height >= 1080:
         return PROFILES["light"]
+    # 老容器优先于分辨率判断：1024x768 的 .wmv 也应按 WMV 处理
+    # （README 的策略表写的就是「legacy: <=480p / WMV / AVI」，与分辨率无关）。
+    # 注意：当前 course_720 与 legacy 的参数完全相同，所以这条顺序只影响语义
+    # 归类与日志，不改变实际处理结果；但顺序写反会误导排查。
+    if info.container in legacy_containers:
+        return PROFILES["legacy"]
     if height and height >= 700:
         return PROFILES["course_720"]
-    if (height and height <= 480) or info.container in legacy_containers:
+    if height and height <= 480:
         return PROFILES["legacy"]
     return PROFILES["course_720"]

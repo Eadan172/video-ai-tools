@@ -6,7 +6,17 @@
     python main.py retry     将 FAILED_FINAL 任务重置为 RETRY_PENDING
     python main.py cleanup   手动清理 work/ 临时文件
     python main.py verify    校验 output/ 所有最终文件
+    python main.py estimate  预估批量耗时与自动档位（只探测，不处理）
+    python main.py tiers     列出可选修复档位（范围/深度/具体操作/耗时）
     python main.py doctor    环境依赖检查
+
+全局参数（写在子命令之前）：
+    --config <文件>          指定配置文件
+    --format <格式>          mp4(默认) / mkv / mov / webm / avi
+    --tier <档位>            auto(默认) / light / standard / full
+    --only <子目录>          只处理 input/ 下的指定子目录（可重复）
+    --input <目录>           覆盖输入目录（estimate 可直接指向任意目录）
+    --no-ai                  跳过两个 AI 修复阶段，只做转码导出
 """
 
 from __future__ import annotations
@@ -24,15 +34,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from adapters import FFmpegAdapter, FFprobeAdapter, RealVideoEnhancerAdapter  # noqa: E402
 from adapters.deepfilternet import DeepFilterNetAdapter  # noqa: E402
 from pipeline.cleanup import Cleaner  # noqa: E402
-from pipeline.config import (CONTAINER_PROFILES, apply_output_format,
+from pipeline.config import (CONTAINER_PROFILES, REPAIR_TIERS,
+                             apply_output_format, apply_repair_tier,
                              load_config)  # noqa: E402
 from pipeline.database import Database  # noqa: E402
 from pipeline.logger import setup_logging  # noqa: E402
+from pipeline.planner import RepairPlanner  # noqa: E402
 from pipeline.resources import ResourceMonitor  # noqa: E402
 from pipeline.scanner import Scanner  # noqa: E402
 from pipeline.scheduler import Scheduler  # noqa: E402
 from pipeline.state_machine import JobStatus  # noqa: E402
 from pipeline.verifier import Verifier  # noqa: E402
+from profiles.selector import select_profile  # noqa: E402
 
 
 # ---------------------------------------------------------------------- #
@@ -43,11 +56,15 @@ def _bootstrap(args) -> tuple:
         apply_output_format(cfg, args.format)
     if getattr(args, "only", None):
         cfg.raw.setdefault("input", {})["include"] = list(args.only)
+    if getattr(args, "input", None):
+        cfg.raw.setdefault("paths", {})["input"] = args.input
+    if getattr(args, "tier", None):
+        apply_repair_tier(cfg, args.tier)
     if getattr(args, "no_ai", False):
-        # AI 组件缺失时的兜底：跳过两个 AI 阶段，只做转码导出，
-        # 避免每个任务都在 REPAIR_VIDEO 直接 FAILED_FINAL
+        # 兜底开关，优先级高于 --tier：两个 AI 阶段全关，只做转码导出
         cfg.raw.setdefault("video_repair", {})["enabled"] = False
         cfg.raw.setdefault("audio_repair", {})["enabled"] = False
+        cfg.raw.setdefault("video_repair", {})["tier"] = "light"
     cfg.ensure_dirs()
     setup_logging(cfg.paths["logs"])
     db = Database(cfg.paths["database"])
@@ -115,6 +132,9 @@ def cmd_status(args) -> int:
     print(f"Intel QSV        : {qsv}")
     print(f"Output Format    : .{cfg.output_ext}  "
           f"({cfg.output.get('video_codec')} + {cfg.output.get('audio_codec')})")
+    tier = str(cfg.video_repair.get("tier") or "auto")
+    print(f"Repair Tier      : {tier}  "
+          f"({REPAIR_TIERS.get(tier, {}).get('summary', '')})")
     if cfg.raw.get("input", {}).get("include"):
         print(f"Input Scope      : {', '.join(cfg.raw['input']['include'])}")
 
@@ -176,6 +196,129 @@ def cmd_verify(args) -> int:
             bad += 1
     print(f"\n校验完成: {ok} 通过, {bad} 失败")
     return 1 if bad else 0
+
+
+def cmd_estimate(args) -> int:
+    """批量预估：只探测、不处理，报告耗时与自动档位结论。
+
+    规划 30+ 个长视频的批量之前先跑这个，避免一头扎进要跑几天的任务。
+    """
+    cfg = load_config(args.config)
+    if getattr(args, "format", None):
+        apply_output_format(cfg, args.format)
+    if getattr(args, "only", None):
+        cfg.raw.setdefault("input", {})["include"] = list(args.only)
+    if getattr(args, "input", None):
+        cfg.raw.setdefault("paths", {})["input"] = args.input
+    if getattr(args, "tier", None):
+        apply_repair_tier(cfg, args.tier)
+
+    ffprobe = FFprobeAdapter()
+    # discover_files() 不碰数据库，这里传 None 即可
+    scanner = Scanner(cfg.paths["input"], cfg.raw["input"]["extensions"], None,
+                      cfg.raw["input"].get("include"))
+    files = scanner.discover_files()
+    if not files:
+        print("input/ 下没有找到待处理的视频文件")
+        return 0
+
+    infos = []
+    skipped = 0
+    for p in files:
+        try:
+            info = ffprobe.probe(str(p))
+        except Exception as exc:  # noqa: BLE001 —— 探测失败仅跳过，不影响预估
+            print(f"[跳过] {p.name}: {exc}")
+            skipped += 1
+            continue
+        infos.append((info, select_profile(info, cfg.raw.get("profiles", {}))))
+    if not infos:
+        print("没有可预估的文件")
+        return 0
+
+    planner = RepairPlanner(cfg.video_repair, pending_jobs=len(infos))
+    est = planner.batch_estimate(infos)
+    auto = (cfg.video_repair.get("auto") or {})
+    budget_total = float(auto.get("total_budget_hours", 12))
+
+    in_dir = cfg.paths["input"]
+    tier_now = str(cfg.video_repair.get("tier") or "auto")
+    print("批量预估（只探测，不处理任何文件）")
+    print("=" * 62)
+    print(f"修复档位          : {tier_now}"
+          f"（{REPAIR_TIERS.get(tier_now, {}).get('label', '')}）")
+    print(f"文件数            : {est['files']}")
+    print(f"总时长            : {est['total_duration_hours']:.1f} 小时")
+    print(f"单文件时间预算    : {est['budget_per_job_hours']:.2f} 小时"
+          f"（总预算 {budget_total:.1f}h ÷ {est['files']}）")
+    print(f"画质 AI 完整档     : {est['est_full_hours']:.1f} 小时（1x+2x）")
+    print(f"画质 AI 快速档     : {est['est_fast_hours']:.1f} 小时（仅 2x）")
+    print(f"音质 AI（预估）    : {est['est_audio_hours']:.1f} 小时")
+    print("-" * 62)
+
+    chosen = est["est_chosen_hours"]
+    n_decomp = sum(1 for r in est["rows"] if r["use_decompress"])
+    if not planner.enabled:
+        print("自动档位          : 已关闭（auto.enabled=false，按配置执行）")
+    elif not planner.configured:
+        print("自动档位          : 仅 2x —— 未配置 1x 压缩修复模型")
+    else:
+        print(f"自动档位          : {'1x+2x（完整修复）' if n_decomp else '2x（仅超分）'}"
+              f"  {n_decomp}/{est['files']} 个文件启用压缩修复")
+        if est["rows"]:
+            print(f"  理由：{est['rows'][0]['reason']}")
+    print(f"预计画质 AI 总耗时 : {chosen:.1f} 小时"
+          f"（外加音质约 {est['est_audio_hours']:.1f}h 与转码/合流）")
+    worst = max(est["rows"], key=lambda r: r["chosen_h"])
+    if worst["chosen_h"] > est["budget_per_job_hours"]:
+        print(f"  [注意] 最慢的单文件约 {worst['chosen_h']:.1f}h，已超单文件预算 "
+              f"{est['budget_per_job_hours']:.2f}h。预算只用于决定是否启用压缩修复，"
+              f"不会限速；如需更宽松可调大 video_repair.auto.total_budget_hours")
+    if skipped:
+        print(f"  [注意] {skipped} 个文件探测失败已跳过")
+    print("-" * 62)
+    print("单文件明细：")
+    print(f"  {'文件':<34}{'时长':>8}{'分辨率':>11}{'编码':>8}{'档位':>8}"
+          f"{'完整档':>9}{'快速档':>9}")
+    for r in est["rows"]:
+        name = str(r["name"]).replace(str(in_dir) + "\\", "").replace(
+            str(in_dir) + "/", "")
+        if len(name) > 32:
+            name = "…" + name[-31:]
+        print(f"  {name:<34}{r['duration_min']:>7.1f}m{r['resolution']:>11}"
+              f"{r['codec']:>8}{'1x+2x' if r['use_decompress'] else '2x':>8}"
+              f"{r['est_full_h']:>8.1f}h{r['est_fast_h']:>8.1f}h")
+    print()
+    print("提示：这里是估算，不是限额；实际耗时受分辨率、码率与后台负载影响。")
+    print("      档位由 pipeline/planner.py 按实测标定自动决定，无需手改配置。")
+    return 0
+
+
+def cmd_tiers(args) -> int:
+    """列出可选的修复档位：修复范围 / 修复深度 / 具体操作 / 实测耗时。"""
+    print("修复档位一览 —— 用 --tier <名称> 选择，或双击 run.bat 弹出菜单")
+    print("=" * 72)
+    for i, (key, t) in enumerate(
+            [(k, REPAIR_TIERS[k]) for k in ("light", "standard", "full")], 1):
+        print(f"[{i}] {key:<9}{t['label']}")
+        print(f"    修复范围：{t['scope']}")
+        print(f"    修复深度：{t['depth']}")
+        print(f"    具体操作：{t['steps']}")
+        print(f"    实测耗时：{t['est_hours_per_68min']}（68 分钟 / 712×400 片源）")
+        print()
+    t = REPAIR_TIERS["auto"]
+    print(f"[0] auto     {t['label']}（默认）")
+    print(f"    修复范围：{t['scope']}")
+    print(f"    修复深度：{t['depth']}")
+    print(f"    具体操作：{t['steps']}")
+    print("=" * 72)
+    print("用法示例：")
+    print("  python main.py --tier standard scan   # 再 python main.py --tier standard run")
+    print("  python main.py --tier full --only 剧集 estimate    # 先看要跑多久")
+    print("  run.bat                                           # 双击，弹菜单选档位")
+    print()
+    print("说明：档位只决定「做不做 AI、做到哪一步」；输出格式另由 --format 决定。")
+    return 0
 
 
 def cmd_doctor(args) -> int:
@@ -277,8 +420,14 @@ def main() -> int:
                         help="输出文件格式（默认 mp4；容器决定编码组合）")
     parser.add_argument("--only", action="append", metavar="子目录",
                         help="只处理 input/ 下的指定子目录（可重复，如 --only 剧集）")
+    parser.add_argument("--input", metavar="目录",
+                        help="覆盖输入目录（默认取 config 的 paths.input）；"
+                             "estimate 可直接指向任意目录")
+    parser.add_argument("--tier", choices=sorted(REPAIR_TIERS),
+                        help="修复档位：auto(默认，自动) / light(仅转码) / "
+                             "standard(2x AI 超分+音质) / full(1x+2x+音质)")
     parser.add_argument("--no-ai", action="store_true",
-                        help="跳过两个 AI 修复阶段，只做转码导出（AI 组件缺失时的兜底）")
+                        help="跳过两个 AI 修复阶段，只做转码导出（等价 --tier light）")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in [
         ("scan", "扫描 input/ 建立任务队列"),
@@ -287,6 +436,8 @@ def main() -> int:
         ("retry", "重置失败任务"),
         ("cleanup", "清理临时文件"),
         ("verify", "校验 output/ 最终文件"),
+        ("estimate", "预估批量耗时与自动档位（只探测，不处理）"),
+        ("tiers", "列出可选修复档位（范围/深度/具体操作/耗时）"),
         ("doctor", "环境依赖检查"),
     ]:
         sub.add_parser(name, help=help_text)
@@ -295,7 +446,8 @@ def main() -> int:
     handlers = {
         "scan": cmd_scan, "run": cmd_run, "status": cmd_status,
         "retry": cmd_retry, "cleanup": cmd_cleanup,
-        "verify": cmd_verify, "doctor": cmd_doctor,
+        "verify": cmd_verify, "estimate": cmd_estimate, "tiers": cmd_tiers,
+        "doctor": cmd_doctor,
     }
     return handlers[args.command](args)
 
