@@ -1,6 +1,6 @@
 # =============================================================================
 # 单机无人值守批量视频处理系统 —— 配置
-# 基准硬件：CPU 22 核 / RAM 16GB / RTX 4060 8GB / Intel Arc 8GB / 磁盘 50GB
+# 主要参数基准：22 核 CPU / 16GB RAM / 8GB 显存 GPU + 支持 QSV 的集显 / 50GB 可用磁盘
 #
 # 路径约定：本文件中以 ./ 或 ../ 开头的路径，一律相对于「本配置文件所在目录」
 #          解析为绝对路径（见 pipeline/config.py::Config.resolve_tools）。
@@ -20,13 +20,12 @@ paths:
 resources:
   cpu_cores: 22
   ram_total_gb: 16
-  # 注意：本机 16GB 内存的**基线占用约 85%**（系统 + 常驻应用），
-  # 原默认值 80/92 会导致 ram_allows_new_stage() 永远返回 False、
-  # 流水线在 _wait_resources 处死等到 600s 超时。
-  # 故按实际基线放宽；若换到内存更空闲的机器可再调回。
+  # 阈值按 16GB 机器的实际基线放宽：用默认 80/92 时，常驻应用占用偏高会让
+  # ram_allows_new_stage() 长期返回 False、流水线在 _wait_resources 死等超时。
+  # 换到内存更空闲的机器可调回 80/92。
   ram_soft_limit_percent: 92      # RAM 超过 92%：禁止启动新阶段
   ram_hard_limit_percent: 97      # RAM 超过 97%：暂停/降级
-  max_video_ai_jobs: 1            # 绝不允许两个 AI 视频同时抢 RTX 4060
+  max_video_ai_jobs: 1            # 绝不允许两个 AI 视频同时抢同一块推理卡
   max_audio_jobs: 1
   max_transcode_jobs: 1
   monitor_interval_seconds: 15
@@ -50,7 +49,7 @@ disk:
   output_multiplier: 1.2
 
 # ---------------------------------------------------------------------------
-# GPU：RTX 4060 只负责 AI 视频修复；Intel Arc 优先 QSV 编码
+# GPU：NVIDIA 卡只负责 AI 视频修复；集显优先 QSV 编码
 # ---------------------------------------------------------------------------
 gpu:
   ai_gpu:
@@ -74,8 +73,8 @@ gpu:
 #     （RVE 需 numpy 2.x，DeepFilterNet 需 numpy<2），故必须独立环境。
 #
 # device 切换：
-#   device: cuda → 需 CUDA 版 torch（torch==2.7.0+cu128，本机已装）
-#                  实测 RTX 4060 Laptop：2 秒视频 16 秒跑完（CPU 需 365~552 秒，约 22~34x）
+#   device: cuda → 需 CUDA 版 torch（torch==2.7.0+cu128）
+#                  实测：2 秒视频约 16 秒跑完（CPU 需 365~552 秒，约 22~34x）
 #   device: cpu  → CPU 版 torch（torch==2.5.1+cpu）仅建议做功能验证
 #   安装：powershell -ExecutionPolicy Bypass -File scripts\setup_ai_tools.ps1 -Cuda
 #   自检：./.venv-rve/Scripts/python.exe scripts/verify_cuda.py --bench
