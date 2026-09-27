@@ -158,18 +158,25 @@ video_repair:
   extra_args: []
 
 # ===========================================================================
-# 音频 AI 修复：DeepFilterNet 0.5.6（CPU）
+# 音频处理：默认**关闭 AI 降噪**（保持源声场完整）
 #
-# 关键点：
-#   * 上游 `deepFilter` 用 DataLoader(num_workers=2) 启动子进程预取音频，
-#     在受限/无人值守环境会报 “DataLoader worker exited unexpectedly”。
-#     故此处经 tools/df_enhance_cli.py 以 num_workers=0 在主进程内运行
-#     （行为等价，不修改第三方包源码）。
-#   * 模型首跑自动从 GitHub 下载到用户缓存目录，无需手工准备。
-#   * 输出命名 <stem>_DeepFilterNet3.wav，适配器会自动重命名为 audio_clean.wav。
+# 为什么关掉 DeepFilterNet（实测结论，勿轻易改回）：
+#   DFN 是**语音增强**模型，设计目标是"提取人声、抑制非语音"。对课程录像
+#   这类需要完整声场的素材，它会把环境音/音乐/混响当噪声**整体重新合成**，
+#   而不是按 dB 衰减。对 录像01 同一 60 秒段落实测（对比"不做 DFN"的对照）：
+#     * 3–6 kHz 能量占比 26.2% → 10.7%（砍掉近 60%）→ 听感"模糊不清"
+#     * 频谱质心 1754 Hz → 1171 Hz（整体变闷）
+#     * 波形相关系数 -0.001（几乎零相关，说明是重合成而非增强）
+#     * RMS 电平 -30.1 dB → -34.7 dB
+#   叠加因素：本批 37 个源片全部是 mono / 22050 Hz / 20 kbps 的 wmav2，
+#   DFN 在 48 kHz 上训练，对这种低采样率低码率输入处理异常。
+#   调 --atten-lim 也救不了——模型输出是重合成，不是衰减。
+#
+# 关闭后的行为：只把源音频重编码为 AAC 320k / 48 kHz（声场百分之百保留），
+# 代价是源本身的底噪与压缩伪影也会保留。
 # ===========================================================================
 audio_repair:
-  enabled: true
+  enabled: false                  # true 会启用下面的 deepfilternet 后端
   backend: "deepfilternet"        # deepfilternet | clearervoice | none
   executable: "./.venv/Scripts/python.exe"
   sample_rate: 48000
