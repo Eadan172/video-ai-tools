@@ -99,6 +99,7 @@ footer{color:var(--dim);font-size:12px;padding:0 18px 24px}
   <h1>视频处理实时监控</h1>
   <div class="stats" id="stats"></div>
   <div class="meta" id="meta"></div>
+  <div class="meta" id="freshness"></div>
 </header>
 <main id="grid"></main>
 <footer>
@@ -110,8 +111,10 @@ const GRID = document.getElementById('grid');
 const BANNER = document.getElementById('banner');
 const STATS = document.getElementById('stats');
 const META = document.getElementById('meta');
+const FRESHNESS = document.getElementById('freshness');
 const cards = new Map();
 let failCount = 0;
+let lastOk = 0;
 
 function el(tag, cls, text){
   const e = document.createElement(tag);
@@ -174,6 +177,7 @@ function updateCard(c, j){
 }
 
 function render(data){
+  lastOk = Date.now();
   const stats = [
     ['总数', data.total, ''], ['完成', data.done, 'done'],
     ['运行', data.running, 'running'], ['等待', data.waiting, 'waiting'],
@@ -242,8 +246,28 @@ async function refresh(){
   }
 }
 
+function updateFreshness(){
+  if(!lastOk){
+    FRESHNESS.textContent = '尚未取得数据…';
+    return;
+  }
+  const s = Math.max(0, Math.round((Date.now() - lastOk) / 1000));
+  FRESHNESS.textContent = s <= 1
+    ? '数据刚刚更新'
+    : ('数据最后更新于 ' + s + ' 秒前' +
+       (s > 10 ? '　（浏览器会节流后台标签页的定时器，切回本页会自动补取一次）' : ''));
+}
+
+// 后台标签页里 setInterval 会被浏览器节流（可能降到 1 次/分钟），切回来看时
+// 还是旧数据。可见性变化时立刻补一次，避免"看上去没有自动刷新"。
+document.addEventListener('visibilitychange', () => {
+  if(!document.hidden) refresh();
+});
+
 refresh();
 setInterval(refresh, INTERVAL_MS);
+setInterval(updateFreshness, 1000);
+updateFreshness();
 </script>
 </body>
 </html>

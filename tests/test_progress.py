@@ -161,27 +161,76 @@ def test_done_job_is_100_even_when_all_ai_stages_skipped(nocache, db, project_di
     assert v.eta_s == 0.0
 
 
-def test_stage_fraction_is_capped_below_100(nocache, db, project_dir):
-    """阶段内细化封顶 95%：即使 elapsed 远超预估，也不能显示 100%。"""
+def test_stage_fraction_is_monotonic_and_bounded():
+    """阶段内进度换算：单调递增、永不到 1。"""
+    xs = [P.stage_fraction(r) for r in (0, 0.25, 0.5, 1.0, 1.5, 2, 3, 5, 20)]
+    assert xs == sorted(xs)
+    assert xs[0] == 0.0
+    assert all(0.0 <= x < 1.0 for x in xs)
+    assert P.stage_fraction(1.0) == pytest.approx(0.90)
+    # 超过预估后仍必须继续增长（原实现在这里硬封顶 → 变成常量）
+    assert P.stage_fraction(3.0) > P.stage_fraction(1.5) > P.stage_fraction(1.0)
+
+
+def test_running_percent_advances_over_time(nocache, db, project_dir):
+    """核心回归：「看板长时间显示同一状态」的守门测试。
+
+    原实现用 min(elapsed/est, 0.95) 硬封顶，于是长阶段（REPAIR_VIDEO 约 24
+    分钟）里 percent 与 eta 全退化成常量——页面每 3 秒确实取到新数据，但新旧
+    数据一模一样，看上去就像没自动刷新。这里断言进度必须随时间推进。
+    """
     db_path = project_dir / "pipeline.db"
     now = datetime.now(timezone.utc)
+    base = now - timedelta(minutes=5)
     _seed(db_path, jobs=[_job(1, "a.wmv", JobStatus.RUNNING, Stage.REPAIR_VIDEO,
-                              started=_iso(now - timedelta(minutes=1)))],
+                              started=_iso(base))],
           stages=[(1, Stage.REPAIR_VIDEO.value, StageResult.RUNNING.value, 2,
-                   _iso(now - timedelta(minutes=1)), None, "")])
+                   _iso(base), None, "")])
 
-    early = P.build_snapshot(nocache, now_ts=now.timestamp()).jobs[0]
-    assert early.percent is not None and 0 < early.percent < 100
+    pcts, etas, elaps = [], [], []
+    for minutes in (5, 15, 30, 60, 180):
+        at = base + timedelta(minutes=minutes)
+        v = P.build_snapshot(nocache, now_ts=at.timestamp()).jobs[0]
+        assert v.percent is not None and v.eta_s is not None
+        pcts.append(v.percent)
+        etas.append(v.eta_s)
+        elaps.append(v.elapsed_s)
 
-    # 把阶段起点挪到很久以前 —— 模拟"重试间隔把 elapsed 撑爆"
+    assert pcts == sorted(pcts) and pcts[0] < pcts[-1], f"百分比未随时间推进: {pcts}"
+    assert etas == sorted(etas, reverse=True) and etas[0] > etas[-1], \
+        f"剩余时间未随时间递减: {etas}"
+    assert pcts[-1] < 100.0
+    # 「已用时长」也必须跟着走（旧实现因时间戳自相矛盾而恒为 0）
+    assert elaps[0] > 0 and elaps == sorted(elaps) and elaps[-1] > elaps[0]
+
+
+def test_stale_stage_start_falls_back_to_attempt_start(nocache, db, project_dir):
+    """阶段 started_at 被 COALESCE 冻结在首次尝试时不能采信。
+
+    实测 job12 的 REPAIR_VIDEO.started_at 停在 08:24，而它最后一次尝试在
+    14:02——差 5.5 小时。若照用会算出几个小时，进度直接饱和成常量。
+    """
+    db_path = project_dir / "pipeline.db"
+    now = datetime.now(timezone.utc)
+    attempt = now - timedelta(minutes=10)      # 本次尝试 10 分钟前开始
+    _seed(db_path,
+          jobs=[_job(1, "a.wmv", JobStatus.RUNNING, Stage.REPAIR_VIDEO,
+                     started=_iso(attempt))],
+          # 阶段起点远早于本次尝试 → 属陈旧值，应退回 attempt_start
+          stages=[(1, Stage.REPAIR_VIDEO.value, StageResult.RUNNING.value, 2,
+                   _iso(now - timedelta(hours=6)), None, "")])
+
+    v = P.build_snapshot(nocache, now_ts=now.timestamp()).jobs[0]
+
+    # 与"阶段起点就是本次尝试起点"的结果一致
     _seed(db_path, stages=[(1, Stage.REPAIR_VIDEO.value,
                             StageResult.RUNNING.value, 2,
-                            _iso(now - timedelta(hours=100)), None, "")])
-    late = P.build_snapshot(nocache, now_ts=now.timestamp()).jobs[0]
+                            _iso(attempt), None, "")])
+    v2 = P.build_snapshot(nocache, now_ts=now.timestamp()).jobs[0]
 
-    assert late.percent is not None
-    assert late.percent < 100.0                 # 绝不能到 100
-    assert late.percent > early.percent         # 但确实在推进
+    assert v.percent == pytest.approx(v2.percent)
+    assert v.elapsed_s == pytest.approx(600, abs=5)     # 10 分钟，而非 6 小时
+    assert v.percent < 50.0                              # 没有被陈旧值顶到饱和
 
 
 def test_not_started_shows_queue_position_not_zero_percent(nocache, db,
@@ -215,17 +264,35 @@ def test_retry_pending_keeps_percent_and_eta(nocache, db, project_dir):
     assert v.error.startswith("RVE")
 
 
-def test_stale_finished_at_does_not_produce_fake_elapsed(nocache, db,
-                                                         project_dir):
-    """重跑过的作业 finished_at 残留上次时间，不能据此算出「已用 2 秒」。"""
-    db_path = project_dir / "pipeline.db"
-    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    _seed(db_path, jobs=[_job(1, "a.wmv", JobStatus.RUNNING, Stage.REPAIR_VIDEO,
-                              started=_iso(t0),
-                              finished=_iso(t0 + timedelta(seconds=2)))])
-    v = P.build_snapshot(nocache).jobs[0]
-    assert v.elapsed_s == 0.0                   # 时间戳不自洽 → 不展示
-    assert v.speed is None
+def test_mark_started_refreshes_attempt_and_clears_finished(db):
+    """`mark_started` 必须记录**本次**尝试：刷新 started_at 并清空 finished_at。
+
+    旧实现用 COALESCE 保留首次时间，重试后 started_at 停在几小时前，且残留
+    上一次的 finished_at，导致「已用时长」无从计算、进度被迫饱和。
+    """
+    db.add_job("C:/in/x.wmv", 1000)
+    jid = db.list_jobs()[0].job_id
+
+    # 第一次尝试：记录起始
+    db.mark_started(jid)
+    first = db.get_job(jid)
+    assert first.started_at
+    assert first.finished_at == ""
+
+    # 模拟一次失败结束（终态会写 finished_at）
+    from pipeline.state_machine import JobStatus as JS
+    db.update_status(jid, JS.RUNNING)
+    db.update_status(jid, JS.RETRY_PENDING, error="x")
+    db._conn.execute("UPDATE jobs SET finished_at=? WHERE job_id=?",
+                     ("2020-01-01T00:00:00+00:00", jid))
+    db._conn.commit()
+
+    # 第二次尝试：起始时间必须刷新，且清掉上一次的 finished_at
+    db.update_status(jid, JS.RUNNING)
+    db.mark_started(jid)
+    again = db.get_job(jid)
+    assert again.started_at >= first.started_at
+    assert again.finished_at == "", "重试后必须清空残留的 finished_at"
 
 
 # --------------------------------------------------------------------------- #

@@ -17,6 +17,7 @@ Web 看板（``dashboard.py``）与终端监控（``monitor_tui.py``）共用本
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import statistics
 import threading
@@ -94,8 +95,23 @@ _NOT_STARTED = frozenset({
     JobStatus.WAIT_RESOURCE, JobStatus.WAIT_DISK,
 })
 
-#: 阶段内细化进度封顶：防止重试间隔把进度条顶到 100% 却迟迟不完成
-_STAGE_FRACTION_CAP = 0.95
+
+def stage_fraction(ratio: float) -> float:
+    """把「当前阶段已跑多久 / 预估耗时」换算成阶段进度的占比（0→1，永不到 1）。
+
+    这是修「看板长时间数值不变」的关键。原实现直接 ``min(ratio, 0.95)``
+    **硬封顶**：长阶段（REPAIR_VIDEO 约 24 分钟）里百分比与 ETA 都会退化成
+    常量——页面每 3 秒确实取到了新数据，但新旧数据一模一样，看上去就像
+    没有自动刷新（实测卡在 73.30% / 剩余 8 分）。
+
+    改为两段：``ratio <= 1`` 时线性推进到 0.90；``ratio > 1``（实际比预估慢）
+    转为渐近爬升，每个刷新周期仍在增长，只是越来越慢。
+    """
+    if ratio <= 0:
+        return 0.0
+    if ratio <= 1.0:
+        return 0.90 * ratio
+    return 0.90 + 0.095 * (1.0 - math.exp(-(ratio - 1.0)))
 
 
 # --------------------------------------------------------------------------- #
@@ -467,14 +483,24 @@ def _job_view(job: Job, stages: dict[Stage, StageRow], model: ProgressModel,
                  if stages.get(s) is not None
                  and stages[s].result in (StageResult.DONE, StageResult.SKIPPED))
 
+    # 本次尝试的起止时间。`mark_started` 每次尝试都会刷新 started_at 并清空
+    # finished_at，所以对重跑过的作业也可靠（旧实现保留首次时间，只能不显示）
+    attempt_start = _parse(job.started_at)
+    attempt_end = _parse(job.finished_at)
+
     # 阶段内细化：仅当作业在跑且当前阶段正在执行
     frac = 0.0
     if job.status is JobStatus.RUNNING and job.stage in est:
         row = stages.get(job.stage)
-        started = _parse(row.started_at) if row else None
-        if started is not None:
-            used = (now_dt - started).total_seconds()
-            frac = min(max(used / est[job.stage], 0.0), _STAGE_FRACTION_CAP)
+        stage_start = _parse(row.started_at) if row else None
+        # `job_stages.started_at` 被 COALESCE 冻结在**首次**尝试上（实测 job12
+        # 差 5.5 小时），只有它不早于本次尝试起始时才可采信，否则退回尝试起始
+        ref = attempt_start
+        if stage_start and attempt_start and stage_start >= attempt_start:
+            ref = stage_start
+        if ref is not None:
+            used = max((now_dt - ref).total_seconds(), 0.0)
+            frac = stage_fraction(used / est[job.stage])
     cur_w = est.get(job.stage, 0.0) * frac
 
     if job.status is JobStatus.DONE:
@@ -490,16 +516,12 @@ def _job_view(job: Job, stages: dict[Stage, StageRow], model: ProgressModel,
         percent = min((done_w + cur_w) / total * 100.0, 99.0)
         eta = max(total - done_w - cur_w, 0.0)
 
-    # 「已用时长」只在时间戳自洽时展示。
-    # 重跑过的作业 `jobs.finished_at` 会残留上一次尝试的结束时间，而
-    # `started_at` 也不随新尝试刷新（见 report 的坑 2）——直接用会算出
-    # 「已用 2 秒」这种荒谬值。宁可不显示，也不显示错的。
+    # 「已用时长」：运行中取本次尝试起始，DONE 取本次尝试的起止
     elapsed = 0.0
-    a, b = _parse(job.started_at), _parse(job.finished_at)
-    if job.status is JobStatus.DONE and a and b:
-        elapsed = (b - a).total_seconds()
-    elif job.status is JobStatus.RUNNING and a and not b:
-        elapsed = (now_dt - a).total_seconds()
+    if job.status is JobStatus.DONE and attempt_start and attempt_end:
+        elapsed = (attempt_end - attempt_start).total_seconds()
+    elif job.status is JobStatus.RUNNING and attempt_start:
+        elapsed = max((now_dt - attempt_start).total_seconds(), 0.0)
 
     # 「处理速度」= 片源时长 ÷ 已耗时（倍速）。刚开始跑时 elapsed 极小，
     # 算出来会是几百倍的荒谬值，故满 2 分钟才开始显示。

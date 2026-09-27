@@ -161,9 +161,22 @@ class Database:
                                (stage.value, job_id))
 
     def mark_started(self, job_id: int) -> None:
+        """记录**本次尝试**的开始时间。
+
+        刻意不用 COALESCE：进度看板要知道"当前这次已经跑了多久"，若保留首次
+        尝试时间，重跑过的作业会算出几个小时这种荒谬值（实测 job12 的
+        started_at 停在 08:24，而它最后一次尝试在 14:02）。
+
+        顺带清掉上一次尝试遗留的 finished_at，否则时间戳自相矛盾（状态是
+        RUNNING 却有结束时间），调用方只能选择不显示耗时。
+
+        代价：DONE 作业的 `finished_at - started_at` 只反映**最后一次**尝试的
+        耗时，不再包含重试空档。这一点被 progress.py 的阶段耗时统计另行规避
+        （它按 `attempts > 2` 剔除真重跑过的样本）。
+        """
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE jobs SET started_at=COALESCE(started_at, ?) WHERE job_id=?",
+                "UPDATE jobs SET started_at=?, finished_at='' WHERE job_id=?",
                 (utcnow(), job_id))
 
     def set_error(self, job_id: int, error: str) -> None:
