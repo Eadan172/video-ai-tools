@@ -62,6 +62,23 @@ CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id);
 """
 
 
+def open_readonly(path: str | Path, timeout: float = 3.0) -> sqlite3.Connection:
+    """只读连接：供监控 / 看板等旁观者使用。
+
+    刻意不复用 ``Database``——它的 ``__init__`` 会执行
+    ``PRAGMA journal_mode=WAL`` 与 ``executescript(_SCHEMA)``，两者都是写操作，
+    在调度器正在写库时会争抢写锁；若库文件被设为只读还会直接抛
+    ``attempt to write a readonly database``。
+
+    库文件不存在时抛 sqlite3.OperationalError，调用方需自行兜底为空态。
+    """
+    conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True,
+                           check_same_thread=False, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=3000")
+    return conn
+
+
 class Database:
     """线程安全的 SQLite 封装（单写者多读者，check_same_thread=False + 锁）。"""
 

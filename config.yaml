@@ -255,3 +255,18 @@ profiles:
   overrides: {}
   # overrides:
   #   "S01E04.mp4": "legacy"
+
+# ---------------------------------------------------------------------------
+# 进度监控（只读旁观者，不参与处理）
+#   python main.py dashboard   本地 Web 看板（绑 127.0.0.1，浏览器打开）
+#   python main.py monitor     终端实时监控（原地重绘）
+#   双击 dashboard.bat         等价于 dashboard --open
+#
+# 进度与剩余时间由**历史实测阶段耗时**推算（截尾中位数），不改数据库表结构；
+# 因此刚跑第一批时估算偏粗，随着已完成作业增多会越来越准。
+# ---------------------------------------------------------------------------
+dashboard:
+  port: 8765
+  interval_seconds: 3          # Web 看板刷新间隔（秒）
+  tui_interval_seconds: 5      # 终端 TUI 刷新间隔（秒）
+  model_ttl_seconds: 60        # 阶段耗时模型缓存时长，防百分比抖动

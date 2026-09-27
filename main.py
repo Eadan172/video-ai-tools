@@ -9,6 +9,8 @@
     python main.py estimate  预估批量耗时与自动档位（只探测，不处理）
     python main.py tiers     列出可选修复档位（范围/深度/具体操作/耗时）
     python main.py doctor    环境依赖检查
+    python main.py monitor   终端实时监控（原地重绘的进度表）
+    python main.py dashboard 本地 Web 进度看板（浏览器打开，只读）
 
 全局参数（写在子命令之前）：
     --config <文件>          指定配置文件
@@ -33,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from adapters import FFmpegAdapter, FFprobeAdapter, RealVideoEnhancerAdapter  # noqa: E402
 from adapters.deepfilternet import DeepFilterNetAdapter  # noqa: E402
+from pipeline import dashboard, monitor_tui  # noqa: E402
 from pipeline.cleanup import Cleaner  # noqa: E402
 from pipeline.config import (CONTAINER_PROFILES, REPAIR_TIERS,
                              apply_output_format, apply_repair_tier,
@@ -441,6 +444,9 @@ def main() -> int:
         ("doctor", "环境依赖检查"),
     ]:
         sub.add_parser(name, help=help_text)
+    # 监控类子命令带自己的参数，单独注册（handler 经 set_defaults 注入）
+    monitor_tui.add_cli(sub)
+    dashboard.add_cli(sub)
     args = parser.parse_args()
 
     handlers = {
@@ -449,6 +455,9 @@ def main() -> int:
         "verify": cmd_verify, "estimate": cmd_estimate, "tiers": cmd_tiers,
         "doctor": cmd_doctor,
     }
+    own = getattr(args, "_handler", None)      # monitor / dashboard 自带 handler
+    if own is not None:
+        return own(args)
     return handlers[args.command](args)
 
 

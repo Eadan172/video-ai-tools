@@ -184,6 +184,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "auto_select": True,
         "overrides": {},                    # 例: {"lesson_001.wmv": "legacy"}
     },
+    # 进度监控（只读旁观者；见 pipeline/progress.py）
+    "dashboard": {
+        "port": 8765,
+        "interval_seconds": 3,              # Web 看板刷新间隔
+        "tui_interval_seconds": 5,          # 终端 TUI 刷新间隔
+        "model_ttl_seconds": 60,            # 阶段耗时模型缓存，防百分比抖动
+    },
 }
 
 # --------------------------------------------------------------------------- #
