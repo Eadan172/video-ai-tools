@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 log = logging.getLogger("pipeline.cleanup")
@@ -17,15 +18,46 @@ log = logging.getLogger("pipeline.cleanup")
 _TEMP_SUFFIXES = {".tmp", ".partial", ".wav"}
 
 
+def unlink_with_retry(path: Path, logger: logging.Logger | None = None,
+                      timeout: float = 60.0) -> bool:
+    """删除文件；Windows 上句柄可能仍被未退出的子进程占用，故等待后重试。
+
+    背景：AI 阶段（RVE / DeepFilterNet）崩溃或刚结束时，其 ffmpeg 子进程
+    可能还活着若干秒并持有中间文件。此时立即 unlink 会抛 WinError 32，
+    而该残留文件会让**后续每一个任务**都在同一处连环失败。因此这里
+    等待句柄释放后重试。
+
+    返回 True 表示文件已不存在（删除成功或本来就没有）。
+    """
+    lg = logger or log
+    p = Path(path)
+    deadline = time.monotonic() + max(0.0, timeout)
+    delay = 0.5
+    while True:
+        try:
+            p.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                lg.warning("删除 %s 失败（等待 %.0fs 后仍被占用）: %s",
+                           p, timeout, exc)
+                return False
+            time.sleep(min(delay, left))
+            delay = min(delay * 2, 5.0)
+
+
 def delete_if_exists(path: Path, logger: logging.Logger | None = None) -> bool:
     lg = logger or log
     p = Path(path)
     try:
         if p.exists() and p.is_file():
             size = p.stat().st_size
-            p.unlink()
-            lg.info("删除临时文件 %s (%.2f MB)", p.name, size / 1024 ** 2)
-            return True
+            if unlink_with_retry(p, lg):
+                lg.info("删除临时文件 %s (%.2f MB)", p.name, size / 1024 ** 2)
+                return True
     except OSError as exc:
         lg.warning("删除失败 %s: %s", p, exc)
     return False
@@ -64,7 +96,7 @@ class Cleaner:
                 continue
             try:
                 if p.is_file():
-                    p.unlink()
+                    unlink_with_retry(p, lg)
                 elif p.is_dir():
                     p.rmdir()
             except OSError as exc:

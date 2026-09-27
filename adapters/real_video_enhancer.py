@@ -23,7 +23,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pipeline.errors import DependencyError
+from pipeline.cleanup import unlink_with_retry
+from pipeline.errors import DependencyError, ResourceBusyError
 from pipeline.runner import run_command
 
 from ._toolpath import which_tool
@@ -156,7 +157,16 @@ class RealVideoEnhancerAdapter:
         args = self._build_args(Path(src), Path(dst), scale)
         log.info("RVE 调用: %s", " ".join(args[1:]))
         if dst.exists():
-            dst.unlink()  # RVE 自身也校验 --overwrite，这里先清干净
+            # RVE 自身也校验 --overwrite，这里先清干净。
+            #
+            # 注意：上一次 RVE 崩溃/退出时，它的 ffmpeg 子进程可能还活着几秒
+            # 并持有该文件；此时直接 unlink 会抛 WinError 32，而且残留文件会
+            # 让**后续每一个任务**都在这一行连环失败（实测一次卡死 34 个任务）。
+            # 故等待句柄释放后重试；仍失败则抛可重试错误，让调度器稍后再来。
+            if not unlink_with_retry(dst, log):
+                raise ResourceBusyError(
+                    f"中间文件 {dst} 仍被其他进程占用，无法清理；"
+                    "请确认没有遗留的 RVE / ffmpeg 进程后重试")
         run_command(args, timeout=self.timeout, log_file=log_file)
         if not Path(dst).exists():
             raise DependencyError(

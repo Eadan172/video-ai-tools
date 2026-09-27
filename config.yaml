@@ -215,7 +215,10 @@ encoder:
   crf: 23
 
 retry:
-  max_attempts: 2                 # 不要无限重试
+  # 3 次（=首次 + 2 次重试）。RVE 在长视频上偶发内存耗尽（实测约 1/4 概率，
+  # 长片源更明显），而每次重试都是**全新的 RVE 进程**，成功率高；
+  # 因此留出 2 次重试，把最终失败率从 ~6% 降到 ~2%。
+  max_attempts: 3
   backoff_seconds: 30
 
 verify:
