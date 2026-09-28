@@ -100,8 +100,11 @@ video_repair:
   upscale: true
   scale_mode: "auto"              # auto | 1x | 2x | 4x（不要盲目固定 4x）
   interpolation: false            # 默认禁止插帧
-  tile: 0                         # 0=整帧推理（CUDA 下推荐，最快）。显存不足报 OOM 时改 512/256；
-                                  # CPU 模式务必设 128，否则会因内存耗尽崩溃（rc=3221225477）
+  tile: 512                       # 分块推理尺寸。0=整帧推理（最快），但可用内存偏小时会崩：
+                                  # 实测本机 16GB、可用仅约 3GB 时，长片源在 RVE 读帧线程
+                                  # 直接 rc=3221225477（cv2 申请 2.3MB 都失败），一批里
+                                  # 出现 6 个「系统内存不足」。512 降峰值内存，代价约慢三成；
+                                  # 显存不足可再降 256，CPU 模式务必设 128。
   crf: 16                         # RVE 内部编码质量
   encoder: "libx264"              # RVE 中间产物编码器；CPU 下 libx264 明显快于 libx265
   timeout_seconds: 14400          # 4h，仅作**兜底下限**。
@@ -155,7 +158,26 @@ video_repair:
     decompress: "./tools/models/1xDeH264_realplksr.pth"
   # RVE 内部调用 ffmpeg 时使用；./ 开头 → 相对于本配置文件目录解析
   ffmpeg_path: "./.tools/ffmpeg/ffmpeg.exe"
-  extra_args: []
+  # 接管 RVE 中间产物（TRANSCODE 之前那份 x264）的编码参数。
+  #
+  # 为什么必须接管：RVE 默认只传 "-c:v libx264"，帧线程数由 ffmpeg 自动决定
+  # （本机 22 核）。x264 帧线程每线程都要持有 2048×1536 的参考帧，实测该
+  # ffmpeg 峰值内存高达 1.58GB —— 是整条流水线里最大、也是唯一可调的内存
+  # 开销，直接导致长片源（录像04/06）整机内存耗尽而崩在读帧线程上：
+  #     numpy._ArrayMemoryError: Unable to allocate 2.25 MiB (768,1024,3)
+  #     → RVE 读帧线程死 → 进程退出 rc=1 / 0xC0000005
+  #     → 崩溃时其 ffmpeg 子进程仍占用 work/current/video_ai.mp4
+  #     → 重试撞 WinError 32 → FAILED_FINAL
+  # 限制到 -threads 6 后该 ffmpeg 峰值降到约 0.4GB，编码 2048×1536@5fps 仍有
+  # 数倍余量（瓶颈在 GPU 推理，不在 CPU 编码），不拖慢整体。
+  #
+  # 注意：一旦传 --custom_encoder，RVE 就不再拼接预设编码参数，所以这里必须
+  # 写全（视频 + 质量 + 音频 + 字幕）。下面这串与原来的
+  #     "-c:v libx264 -crf 16 -b:a 192k -c:a aac -c:s copy"
+  # 完全等价，只是多了 -threads 6。
+  extra_args:
+    - "--custom_encoder"
+    - "-c:v libx264 -threads 6 -crf 16 -b:a 192k -c:a aac -c:s copy"
 
 # ===========================================================================
 # 音频处理：默认**关闭 AI 降噪**（保持源声场完整）
