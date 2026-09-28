@@ -6,19 +6,21 @@
 from __future__ import annotations
 
 import json
-import shutil
 
 from pipeline.errors import ProbeError
 from pipeline.runner import run_command
 from pipeline.state_machine import MediaInfo
 
+from ._toolpath import resolve_ffmpeg, which_tool
+
 
 class FFprobeAdapter:
     def __init__(self, executable: str = "ffprobe") -> None:
-        self.executable = executable
+        # PATH 上没有 ffprobe 时回退到仓库自带的 .tools/ffmpeg（见 _toolpath）
+        self.executable = resolve_ffmpeg(executable)
 
     def available(self) -> bool:
-        return shutil.which(self.executable) is not None
+        return which_tool(self.executable) is not None
 
     def probe(self, path: str, timeout: float = 120) -> MediaInfo:
         """探测媒体文件。无法解析 → ProbeError（视为源文件损坏）。"""

@@ -14,6 +14,8 @@ from pathlib import Path
 from pipeline.errors import DependencyError
 from pipeline.runner import run_command
 
+from ._toolpath import resolve_ffmpeg, which_tool
+
 log = logging.getLogger("adapters.ffmpeg")
 
 
@@ -93,12 +95,13 @@ def audio_bitrate_for(encoder: str, bitrate: str) -> str:
 class FFmpegAdapter:
     def __init__(self, executable: str = "ffmpeg",
                  encoder_cfg: dict | None = None) -> None:
-        self.executable = executable
+        # PATH 上没有 ffmpeg 时回退到仓库自带的 .tools/ffmpeg（见 _toolpath）
+        self.executable = resolve_ffmpeg(executable)
         self.cfg = encoder_cfg or {}
         self._encoders_cache: set[str] | None = None
 
     def available(self) -> bool:
-        return shutil.which(self.executable) is not None
+        return which_tool(self.executable) is not None
 
     # ------------------------------------------------------------------ #
     # 编码器检测
