@@ -1,543 +1,621 @@
 # Video Pipeline — 单机无人值守批量视频处理系统
 
-面向 50+ 网课视频的批量「修复 → 转格式 → 导出」流水线，主要参数基准：
+把一堆**不规则的老视频**（WMV/AVI/MP4 混合、低分辨率、可能有压缩伪影）自动修复成
+**统一交付格式**（默认 MP4 / H.265 / AAC 48kHz），全程本地、可无人值守、可断点续跑。
 
-| 资源 | 参数 |
+> 设计取向：**稳定性 > 吞吐量**。宁可慢一点、失败隔离得更干净，也不要跑一晚上
+> 早上发现整批卡死或全部报废。
+
+| 能力 | 说明 |
 | --- | --- |
-| CPU | 22 核 |
-| RAM | 16GB（严格限制并发，超限禁止启动新阶段） |
-| GPU | 8GB 显存（视频 AI 推理）+ 支持 QSV 的集显（硬件编码） |
-| 磁盘 | 50GB 可用（第一优先级调度约束） |
-
-核心原则：**稳定性 > 吞吐量**。同一时间只有一个视频进入完整工作区
-（`work/current/`），断点续跑、失败隔离、磁盘保护、原子输出。
-
-修复能力现状（本轮已实测跑通）：
-
-| 阶段 | 实现 | 状态 |
-| --- | --- | --- |
-| 画质 AI | REAL-Video-Enhancer 2.4.1 后端 CLI（去压缩伪影 + 超分） | ✅ 可用（CUDA） |
-| 音质处理 | 源音频直通（重编码 AAC / 48 kHz） | ⚠️ **AI 降噪默认关闭**——会破坏课程录像声场，见「音质 AI 为什么默认关闭」 |
+| 画质 AI 修复 | REAL-Video-Enhancer 2.4.1：2x 超分（必开）+ 1x 压缩伪影修复（按预算自动决定） |
+| 音频处理 | 默认**不做 AI 降噪**（只重编码，保住源声场）；可开 DeepFilterNet（自动分段防 OOM） |
+| 格式规范化 | 统一容器/编码/采样率，QSV → NVENC → CPU 自动降级 |
+| 批量与容错 | 磁盘/内存感知调度、失败隔离、断点续跑、内存耗尽自动跳过并重排 |
+| 无人值守 | 守护脚本自动拉起被杀掉的调度器、终止卡死的 RVE；队列跑空自动出报告 |
+| 进度可视化 | 终端 TUI + 本地 Web 看板（只读，不与调度器争锁） |
+| 完全离线 | 模型与 FFmpeg 都在本地，运行期零网络请求 |
 
 ---
 
-## 快速开始（双击即用）
+## 目录
 
-**双击 `run.bat`** 即可，脚本会自动完成：定位/创建虚拟环境 → 安装依赖 →
-定位 FFmpeg（仓库内 `.tools\ffmpeg` → 上级目录 → PATH → 自动下载）→
-检查 AI 组件（缺失则自动降级为纯转码）→ 交互选择输出格式与处理范围 →
-执行 `scan` + `run`。
+- [1. 自动化运行完整步骤](#1-自动化运行完整步骤)
+- [2. 自定义输出视频格式](#2-自定义输出视频格式)
+- [3. 按设备估算处理速度](#3-按设备估算处理速度)
+- [4. 全部可修改参数](#4-全部可修改参数)
+- [5. 常见问题排查与解决](#5-常见问题排查与解决)
+- [附录 A 目录结构](#附录-a-目录结构)
+- [附录 B 错误码与异常分类](#附录-b-错误码与异常分类)
+- [附录 C 实测性能基准](#附录-c-实测性能基准)
+- [附录 D 修复档位详解](#附录-d-修复档位详解)
 
-命令行用法（参数会被透传给流水线）：
+---
 
-```bat
-run.bat                                 双击：交互式，默认 mp4，处理 input\ 全部
-run.bat --format mkv                    输出 mkv
-run.bat --only 剧集                     只处理 input\剧集
-run.bat --no-prompt --format mp4        无人值守，不询问
-run.bat --no-ai                         跳过 AI 修复，只转码（AI 组件缺失时的兜底）
-run.bat --dry-run                       只做环境检查，不处理
-run.bat --selftest                      跑一遍 59 项自测
-```
+## 1. 自动化运行完整步骤
 
-## 输出目录与格式
+### 1.1 环境要求
 
-**输出目录镜像输入子目录**，不同来源互不混淆：
-
-```text
-input/剧集/S01E04.mp4   →   output/剧集/S01E04.mp4
-input/课程/录像01.wmv   →   output/课程/录像01.mp4
-input/xxx.mp4           →   output/xxx.mp4
-```
-
-**输出格式可自定义**（默认 mp4）。容器决定编码组合，避免产出不兼容封装：
-
-| 格式 | 视频编码 | 音频编码 | 说明 |
+| 项目 | 最低 | 推荐 | 说明 |
 | --- | --- | --- | --- |
-| `mp4`（默认） | H.265 | AAC 320k | 兼容性最好 |
-| `mkv` | H.265 | AAC 320k | 无损容器，支持多音轨 |
-| `mov` | H.265 | AAC 320k | 苹果生态 |
-| `webm` | VP9 | Opus 256k | 网页播放（Opus 上限 256k） |
-| `avi` | H.264 | MP3 320k | 老设备兼容 |
+| 操作系统 | Windows 10 x64 | Windows 11 x64 | 脚本是 PowerShell，路径按 Windows 写 |
+| Python | 3.11 | 3.11 | 3.12+ 未见问题，3.10 以下不支持 |
+| 内存 | 8 GB | **16 GB 起** | AI 阶段峰值约 2.3~2.7 GB，且要留余量；8GB 机器建议只跑 `--tier light` |
+| GPU | 无（纯转码） | NVIDIA ≥8 GB VRAM | AI 超分必须有 CUDA；无卡时自动降级为纯转码/CPU 编码 |
+| 磁盘 | 30 GB | 50 GB+ | 源大小 × 1.5 + 成片；阈值见 [参数表](#4-全部可修改参数) |
+| FFmpeg | 必需 | 仓库自带即可 | `scripts/bootstrap.ps1` 会自动下载到 `.tools\ffmpeg\` |
 
-两种指定方式等价：CLI `--format mkv`，或改 `config.yaml` 的 `output.container`。
+> **内存是这台机器的第一约束**：AI 阶段（RVE 推理 + 它自己拉起的编码 ffmpeg）实测
+> 峰值 2.3 GB 左右，若机器同时跑着浏览器/IDE，可用内存不足时会以
+> 「`Unable to allocate 2.25 MiB`」的形式崩在 RVE 的读帧线程里。详见
+> [5.2 内存耗尽](#52-现象-rve-报-unable-to-allocate-225-mib-或-memoryerror)。
 
----
+### 1.2 三种启动方式
 
-## 目录结构
-
-```text
-video_pipeline/
-├── run.bat                 # ★ 双击运行入口（ASCII-only，编码安全）
-├── main.py                 # CLI 入口
-├── config.yaml             # 全部可调参数
-├── requirements.txt
-├── pipeline/               # 业务逻辑（不直接拼命令行）
-│   ├── scheduler.py        # 资源感知调度器（核心）
-│   ├── state_machine.py    # 状态机定义
-│   ├── database.py         # SQLite 持久化
-│   ├── disk_manager.py     # 磁盘空间调度约束
-│   ├── resources.py        # RAM/CPU/GPU 监控
-│   ├── scanner.py          # input 扫描（支持 --only 子目录限定）
-│   ├── verifier.py         # 输出完整性校验 + 智能跳过转码
-│   ├── cleanup.py          # 临时文件清理（绝不碰 input/output）
-│   ├── filename.py         # Windows 安全文件名
-│   ├── runner.py           # subprocess 封装（禁 shell=True）
-│   └── logger.py           # 分层日志
-├── adapters/               # 第三方命令适配层（CLI 差异隔离在这里）
-│   ├── ffprobe.py
-│   ├── ffmpeg.py           # QSV→NVENC→CPU 降级链；容器/编码映射
-│   ├── real_video_enhancer.py   # 驱动 RVE 后端 CLI（绕开 GUI）
-│   ├── deepfilternet.py    # DeepFilterNet / 预留 ClearerVoice
-│   └── _toolpath.py        # 绝对路径 + PATH 均可识别的工具探测
-├── profiles/selector.py    # light / course_720 / legacy 自动策略
-├── tests/                  # pytest（59 项，含真实 FFmpeg 端到端）
-├── tools/                  # AI 组件（体积大故不进版本库，见「安装」）
-│   ├── df_enhance_cli.py   # DeepFilterNet 进程内封装（num_workers=0）
-│   ├── backend/            # RVE 2.4.1 后端源码
-│   └── models/             # 超分 / 压缩修复模型
-├── scripts/
-│   ├── bootstrap.ps1       # ★ 一键运行引导（被 run.bat 调用）
-│   ├── setup_ai_tools.ps1  # 幂等安装两个 AI 组件
-│   ├── verify_repair.py    # 画质/音质量化验证
-│   ├── verify_cuda.py      # CUDA 环境自检与跑分
-│   ├── e2e_batch_test.py   # 端到端批量测试 + 汇总报告
-│   └── install.ps1 / run.ps1 / doctor.ps1
-├── .venv/                  # DeepFilterNet 环境（numpy<2）
-├── .venv-rve/              # RVE 环境（numpy 2.x + torch）
-└── .tools/ffmpeg/          # FFmpeg / FFprobe 静态构建
+```mermaid
+flowchart LR
+    A[input/ 放入视频] --> B{启动方式}
+    B -->|① 双击 run.bat| C[bootstrap.ps1<br/>交互选档位/格式<br/>自动装依赖/找 FFmpeg]
+    B -->|② 命令行 run.ps1| D[带参数无人值守<br/>--tier/--format/--only]
+    B -->|③ 手工 main.py| E[scan → run → 观察]
+    C --> F[调度器 main.py run]
+    D --> F
+    E --> F
+    F --> G[逐个视频：<br/>校验→画质AI→音质→转码→导出→校验]
+    G --> H[output/ 成片]
+    G -->|失败| I[failed/ 隔离 + 报告]
 ```
 
-## 安装
+**① 双击 `run.bat`（最省事）** — 会依次：找/建虚拟环境 → 装依赖 → 定位 FFmpeg
+（仓库内 `.tools\ffmpeg` → 上级目录 → PATH → 自动下载）→ 检查 AI 组件 → 交互式问
+「输出格式」与「处理范围」→ 执行 `scan` + `run`。
 
-**推荐：双击 `run.bat`**，它会自动完成下面所有步骤（只需机器上有 Python 3.11+）。
+**② 命令行 `scripts\run.ps1`（推荐用于无人值守）**
 
-手动安装等价步骤：
+```powershell
+# 只处理 input\课程，输出 mp4（默认），档位自动
+powershell -ExecutionPolicy Bypass -File scripts\run.ps1 --tier auto --only 课程
 
-```bash
-# 1) 基础依赖
-pip install -r requirements.txt
+# 完全无人值守，不询问任何问题
+powershell -ExecutionPolicy Bypass -File scripts\run.ps1 --no-prompt --tier standard --format mp4
 
-# 2) FFmpeg / FFprobe（必需）：放到 .tools\ffmpeg\ 或加进 PATH
-#    也可由 run.bat 自动下载
+# 只做转码（不做 AI），验证链路
+powershell -ExecutionPolicy Bypass -File scripts\run.ps1 --no-ai --only 课程
+```
 
-# 3) 两个 AI 组件（可选，缺失时仍可纯转码运行）
+**③ 手工分步（排障时最有用）**
+
+```powershell
+$env:PATH = "$PWD\.tools\ffmpeg;$env:PATH"   # 让 ffmpeg/ffprobe 可用（新版已内置兜底，可省）
+python main.py doctor      # 环境自检
+python main.py scan        # 扫描 input/ 建队列
+python main.py estimate    # 只预估耗时与档位，不处理任何文件
+python main.py run         # 开跑（Ctrl+C 安全中断，重启续跑）
+python main.py status      # 看队列与资源
+python main.py monitor     # 终端实时进度表
+python main.py dashboard   # 本地 Web 看板（127.0.0.1:8765）
+python main.py verify      # 校验 output/ 全部成片
+```
+
+### 1.3 依赖安装（从零开始）
+
+```powershell
+# 1) 基础依赖（主环境，只跑调度器/转码，不装 torch）
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 2) FFmpeg / FFprobe：放到 .tools\ffmpeg\（两个 exe），或装到 PATH
+#    也可以交给 scripts\bootstrap.ps1 自动下载（约 30 MB，来自 npmmirror 镜像）
+
+# 3) 两个 AI 组件（可选；缺失时流水线自动退化为纯转码，不会崩）
 powershell -ExecutionPolicy Bypass -File scripts\setup_ai_tools.ps1 -Cuda
-```
+#    -Cuda 会用 CUDA 版 torch（RTX 卡必须）；
+#    不加则装 CPU 版，只能做功能验证（比 GPU 慢 20~30 倍）
 
-外部工具依赖：
-
-| 工具 | 用途 | 必需性 |
-| --- | --- | --- |
-| FFmpeg / FFprobe | 解码、转码、合流、探测 | **必需** |
-| REAL-Video-Enhancer | 视频 AI 修复（NVIDIA GPU） | 可选；缺失时 `--no-ai` 降级为纯转码 |
-| DeepFilterNet | CPU 音频降噪 | 可选；同上 |
-
-> 两个 AI 组件必须装在**两个独立虚拟环境**里：RVE 需要 `numpy 2.x`，
-> DeepFilterNet 需要 `numpy < 2`，主版本冲突无法调和。`config.yaml` 里
-> 各自的 `executable` 指向对应解释器，互不干扰。
-
-## 配置
-
-所有参数见 `config.yaml`，关键项：
-
-```yaml
-disk:
-  safe_start_gb: 30        # >= 30GB 才启动新任务
-  pause_new_jobs_gb: 20    # 20~30GB 只继续当前任务
-  emergency_stop_gb: 10    # < 10GB 停止流水线
-video_repair:
-  executable: "..."        # 按本机 REAL-Video-Enhancer 实际 CLI 调整
-  args_template: [...]     # 以 <tool> --help 实际输出为准
-output:
-  container: mp4
-  video_codec: hevc        # h264 | hevc | av1
-  audio_codec: aac
-  audio_bitrate: 320k
-```
-
-## 首次检查
-
-```bash
+# 4) 自检
 python main.py doctor
+.\.venv-rve\Scripts\python.exe scripts\verify_cuda.py --bench   # 复标定 AI 速度
 ```
 
-输出示例：
+安装完成后应能看到：`.venv\`（主环境）、`.venv-rve\`（RVE 专用，numpy 2.x）、
+`.tools\ffmpeg\`、`tools\models\`（超分与压缩修复模型）。
 
-```text
-[OK]   FFmpeg
-[OK]   FFprobe
-[WARN] REAL-Video-Enhancer  (未安装)
-[OK]   NVIDIA NVENC
-[OK]   Intel QSV
-[OK]   Disk free: 47.3 GB
+### 1.4 子命令一览
+
+| 命令 | 作用 | 常用参数 |
+| --- | --- | --- |
+| `scan` | 扫描 `input/` 建/更新任务队列 | `--only 子目录` |
+| `run` | 无人值守主循环（**核心**） | `--tier` `--format` `--no-ai` |
+| `status` | 队列统计 + 磁盘/内存/显存/编码器 | — |
+| `estimate` | **只探测不处理**：逐文件预估耗时与自动档位 | `--input 目录` |
+| `tiers` | 列出三档修复范围/深度/实测耗时 | — |
+| `doctor` | 依赖与环境自检 | — |
+| `verify` | 逐个 ffprobe 校验 `output/` 成片 | — |
+| `retry` | 把 `FAILED_FINAL` 重置为待跑 | — |
+| `cleanup` | 手动清理 `work/` 临时文件 | — |
+| `monitor` | 终端实时进度表（原地重绘） | `--once` `--ascii` `--interval` |
+| `dashboard` | 本地 Web 看板（只读） | `--port` `--open` `--allow-remote` |
+
+全局参数（写在子命令**之前**）：`--config 文件` `--format {mp4,mkv,mov,webm,avi}`
+`--tier {auto,light,standard,full}` `--only 子目录`（可重复）`--input 目录` `--no-ai`。
+
+### 1.5 无人值守：守护脚本
+
+长批次真正会「停住」的故障只有两类，都交给守护脚本：
+
+```mermaid
+flowchart TD
+    W[watchdog_pipeline.ps1<br/>每 5 分钟巡检] --> Q{还有待处理任务?}
+    Q -->|否| R[生成「未导出视频清单」<br/>报告后退出]
+    Q -->|是| S{调度器进程还在?}
+    S -->|不在| T[清理孤儿 RVE/ffmpeg<br/>→ 重新拉起 main.py run]
+    S -->|在| U{RVE 活着但输出<br/>15 分钟无增长?}
+    U -->|是| V[终止该 RVE<br/>任务降到队尾 → 跑下一个]
+    U -->|否| Q
 ```
 
-缺依赖不会崩溃，会列出缺失项和配置提示。
-
-## 使用流程
-
-```bash
-python main.py estimate   # 0. 先看批量要跑多久（只探测，不处理）
-python main.py scan       # 1. 扫描 input/ 建立任务队列
-python main.py run        # 2. 无人值守运行
-python main.py status     # 3. 随时查看状态
-python main.py verify     # 4. 校验 output/ 产物
-python main.py cleanup    # 5. 清理 work/ 临时文件
+```powershell
+# 启动守护（必须用 WMI，见下方注意）
+$root = "E:\WorkBuddy\video-transfer-tools\video_pipeline"
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$root\scripts\watchdog_pipeline.ps1`""
+  CurrentDirectory = $root }
 ```
 
-全局参数（写在子命令**之前**）：
+> **注意**：不要用 `Start-Process` 起守护——它在自动化工具会话结束时会连带被杀掉，
+> 守护就白起了。守护日志写在 `logs\watchdog.log`（每 5 分钟一行）。
 
-| 参数 | 作用 |
+**为什么需要它**（都是实测踩过的坑）：
+
+- 调度器曾被系统在内存压力下**静默杀掉**（无日志、无崩溃记录），队列就此停 2 小时；
+- RVE 会**挂死**在启动阶段（一个字节都不写），调度器只能陪它等到 4 小时超时；
+- 调度器被杀后会留下**孤儿 ffmpeg**，仍占着 `work\current\video_ai.mp4`，导致下一个
+  任务卡在「文件被占用」。
+
+### 1.6 暂停 / 恢复 / 重跑 / 清理
+
+| 场景 | 做法 |
 | --- | --- |
-| `--config <文件>` | 指定配置文件（默认 `config.yaml`） |
-| `--format <格式>` | 输出格式：`mp4`(默认) / `mkv` / `mov` / `webm` / `avi` |
-| `--only <子目录>` | 只处理 input/ 下的指定子目录（可重复） |
-| `--no-ai` | 跳过两个 AI 修复阶段，只做转码导出 |
+| 临时暂停 | 在 `run` 窗口按 `Ctrl+C`（状态已落库，重启续跑，不重做已完成阶段） |
+| 续跑 | 再次 `python main.py run`（已完成阶段按产物存在性跳过） |
+| 某个视频失败 | 看 `failed\job_XXXX\` 与 `logs\jobs\XXXX.log`；修好后 `python main.py retry` 再 `run` |
+| 想让它从某个阶段重做 | 删掉 `work\current\` 下对应产物（或用 `cleanup`），再 `run` |
+| 清理临时文件 | `python main.py cleanup`（只动 `work\`，绝不碰 `input/`、`output/`） |
+| 交付验收 | `python main.py verify`（逐文件 ffprobe 校验时长/流/大小） |
 
-例：
+---
 
-```bash
-./.venv/Scripts/python.exe main.py --format mkv --only 剧集 scan
-./.venv/Scripts/python.exe main.py --format mkv --only 剧集 run
+## 2. 自定义输出视频格式
+
+### 2.1 支持的格式（`--format` / `output.container`）
+
+格式同时决定**容器 + 视频编码 + 音频编码 + 音频码率**，不是只换个后缀：
+
+| `--format` | 容器 | 视频编码 | 音频编码 | 音频码率 | 适用场景 |
+| --- | --- | --- | --- | --- | --- |
+| `mp4`（默认） | MP4 | H.265/HEVC | AAC | 320k | 通用交付、播放器兼容最好 |
+| `mkv` | Matroska | H.265/HEVC | AAC | 320k | 想保留更多音轨/字幕、无 faststart 需求 |
+| `mov` | MOV | H.265/HEVC | AAC | 320k | 进剪辑软件（Premiere/FCP） |
+| `webm` | WebM | VP9 | Opus | **256k** | 网页播放（opus 上限 256k，写 320k 会被 ffmpeg 拒绝） |
+| `avi` | AVI | H.264 | MP3 | 320k | 老播放设备/老编辑软件的兼容兜底 |
+
+### 2.2 三种指定方式（优先级从高到低）
+
+```powershell
+# ① 命令行（会覆盖 config.yaml）
+python main.py --format mkv run
+
+# ② 双击 run.bat 的交互菜单里选
+
+# ③ 写死在 config.yaml（长期生效）
+output:
+  container: "mp4"
 ```
 
-`status` 输出示例：
+### 2.3 输出相关参数
 
-```text
-Video Pipeline
-===============================
-Total Jobs       : 57
-Done             : 42
-Running          : 1
-Waiting          : 12
-Retry Pending    : 1
-Failed Final     : 1
-
-Disk Free        : 27.4 GB
-RAM Usage        : 63%
-RTX VRAM         : 5.8 / 8 GB
-Intel QSV        : READY
-
-Current Job      : lesson_043.wmv
-Stage            : REPAIR_VIDEO
-```
-
-## 暂停与恢复（断点续跑）
-
-- `Ctrl+C` 安全中断：状态保存在 SQLite（`pipeline.db`），不丢任务。
-- 重启电脑后直接 `python main.py run` 即可继续。
-- 续跑粒度是**阶段**：例如 `REPAIR_VIDEO`/`REPAIR_AUDIO`/`TRANSCODE`
-  已完成而 `EXPORT` 失败，重跑时只会重做 `EXPORT`。
-- 续跑判断依据 = SQLite 阶段记录 **+ 产物文件真实存在**，不盲信数据库。
-
-## 失败重试
-
-- `retry.max_attempts: 2` = **最多尝试 2 次**（首次 + 1 次重试）；
-  重试判定为 `retry_count < max_attempts - 1`，第 2 次失败即 `FAILED_FINAL`。
-- GPU OOM → 自动降低超分倍率再试。
-- QSV 失败 → 自动降级 NVENC → 再降级 CPU libx265。
-- 源文件损坏 → 直接 `FAILED_FINAL`（不浪费重试）。
-- 手动给失败任务一次机会：`python main.py retry`
-
-## 清理
-
-```bash
-python main.py cleanup   # 清理 work/ 下所有 .tmp/.partial/.wav 临时文件
-python main.py verify    # 用 ffprobe 校验 output/ 所有最终文件
-```
-
-**红线**：任何自动化流程都不会删除或修改 `input/` 源文件与 `output/`
-已验证文件。
-
-## 磁盘空间策略
-
-```text
-50GB 可用磁盘
- ├─ ≥30GB   正常：允许启动新任务
- ├─ 20~30GB 受控：只继续当前任务
- ├─ 15~20GB 保守：暂停新任务
- ├─ 10~15GB EMERGENCY_CLEANUP：自动清理临时文件
- └─ <10GB   HALT：停止整条流水线
-```
-
-启动每个任务前还会做**单文件空间预算**：
-
-```text
-需求 ≈ 源大小×1.5(视频临时) + 源大小×0.2(音频临时) + 源大小×1.2(输出) + 8GB(余量)
-```
-
-不足则任务进入 `WAIT_DISK`，等空间恢复后自动继续。
-
-## 处理流程（单个视频）
-
-```text
-ffprobe 校验 + 选择 profile（light/course_720/legacy）
-  → NVIDIA GPU 视频 AI 修复（RVE：1x 压缩伪影修复 + 2x 超分，默认不插帧）
-  → 抽取源音频（默认不做 AI 降噪；中间 WAV 用完即删）
-  → 智能判断：已是目标格式则跳过转码，否则 Intel QSV/NVENC/CPU 转码
-  → FFmpeg 合流（-c:v copy，视频绝不二次编码）
-  → ffprobe 校验 → 原子重命名（.partial → .mp4）
-  → 输出到 output/<与 input 同名的子目录>/
-  → 清空 work/current → 下一个视频
-```
-
-## 修复档位（light / 中档 / 完全修复）
-
-用户可直接选择修复档位，不需要改任何模型开关。查看完整说明：
-
-```bash
-./.venv/Scripts/python.exe main.py tiers
-```
-
-| 档位 | 修复范围 | 修复深度 | 具体操作 | 68min 实测 |
+| 参数 | 作用 | 取值 | 默认 | 备注 |
 | --- | --- | --- | --- | --- |
-| `light` | 容器与编码；**不碰**画面/声音内容 | 表面：仅重新封装与编码规范化 | FFmpeg → HEVC + AAC 48k（QSV→NVENC→CPU 降级） | 约 5 分钟 |
-| `standard` 中档 | 画面分辨率/锐度 + 音轨噪声；不做压缩伪影修复 | 深度：2x 分辨率重建 + 时域/频域降噪 | RVE 2x 超分（SPAN）→ 抽 48k WAV → HEVC | 约 1.5 小时 |
-| `full` 完全修复 | 压缩伪影 + 分辨率/锐度 + 音轨噪声，三者全开 | 完整重建：先修块效应/振铃，再重建分辨率，最后降噪 | RVE 1x(RealPLKSR) + 2x(SPAN) → HEVC | 约 14.8 小时 |
-| `auto`（默认） | 由 planner 按片源特征 + 时间预算自动判定 | 自动在中档 / 完全修复间选 | 见下节「自动档位」 | 取决于片源 |
+| `output.container` | 容器 | `mp4` `mkv` `mov` `webm` `avi` | `mp4` | 改它会自动带上对应编码组合 |
+| `output.video_codec` | 视频编码 | `h264` `hevc` `av1` | `hevc` | 手动写时注意与容器匹配 |
+| `output.audio_codec` | 音频编码 | `aac` `mp3` `opus` … | `aac` | webm 要 `opus` |
+| `output.audio_bitrate` | 音频码率 | 如 `128k`/`320k` | `320k` | opus 上限 256k |
+| `output.sample_rate` | 音频采样率 | `44100` / `48000` | `48000` | 源多为 22050Hz，统一升到 48k |
+| `output.keep_subtitles` | 是否保留字幕流 | `true`/`false` | `true` | — |
+| `output.keep_metadata` | 是否保留元数据 | `true`/`false` | `true` | — |
 
-> ⚠️ 上表中「音轨噪声 / 降噪」相关的步骤，在**默认配置下不会执行**：
-> 音质 AI（DeepFilterNet）已默认关闭，原因见「音质 AI 为什么默认关闭（实测结论）」。
+### 2.4 编码后端自动降级链
 
-三种选择方式：
+`encoder.prefer: ["qsv","nvenc","cpu"]` → 依次探测 `hevc_qsv` / `hevc_nvenc` /
+`libx265`，**并且运行失败也会继续降级**（编码器存在 ≠ 硬件可用）。想要更快可把
+`cpu_preset` 换成 `fast`/`veryfast`（体积略增），或把 `qsv_preset` 换 `fast`。
 
-```bat
-:: 1) 命令行
-.\.venv\Scripts\python.exe main.py --tier standard scan
-.\.venv\Scripts\python.exe main.py --tier standard run
+> 小知识：`-movflags +faststart` 只对 mp4/mov 有效，mkv/webm/avi 传了会直接报错，
+> 程序已按容器自动判断。
 
-:: 2) 双击 run.bat —— 会弹出档位菜单
-run.bat
-run.bat --tier full --only 剧集 --no-prompt
+---
 
-:: 3) 改 config.yaml 的 video_repair.tier（长期默认）
+## 3. 按设备估算处理速度
+
+### 3.1 成本模型（这是估时的核心）
+
+画质 AI 耗时按「**单帧成本可分解**」建模（`pipeline/planner.py`）：
+
+```
+秒/帧 = upscale_s_per_mp  × 输出百万像素      ← 2x 超分（必开）
+      + decompress_s_per_mp × 输入百万像素    ← 1x 压缩伪影修复（可选，慢得多）
+总耗时 ≈ 帧数 × 秒/帧 + job_overhead_seconds(30s)
+RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) + 600)
 ```
 
-档位与输出格式是两件独立的事：档位决定「做不做 AI、做到哪一步」，
-`--format` 决定容器与编码组合。二者可自由组合，例如
-`--tier light --format mkv`（只转封装到 mkv，不做 AI）。
+默认标定值（**RTX 4060 Laptop 8G / CUDA / tile=0** 上实测）：
 
-> `--no-ai` 是 `--tier light` 的等价写法。AI 组件缺失时，launcher 会自动
-> 把档位强制为 `light` 并告警——否则每个任务都会在 AI 阶段 FAILED_FINAL。
-
-## 自动档位（批量长视频不必手改配置）
-
-画质修复有 **两档**，实测差 **9 倍**：
-
-| 档位 | 内容 | 68min/712×400 片源 |
+| 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| 完整档 | 1x 压缩伪影修复 + 2x 超分 | 约 14.8 小时 |
-| 快速档 | 仅 2x 超分 | 约 1.5 小时 |
+| `upscale_s_per_mp` | `0.0465` | 每百万**输出**像素的超分耗时（秒） |
+| `decompress_s_per_mp` | `1.64` | 每百万**输入**像素的压缩修复耗时（秒）——比超分贵约 35 倍 |
+| `job_overhead_seconds` | `30` | 模型加载等固定开销 |
 
-因此在 `config.yaml` 里手工写死模型开关，批量处理 30+ 个长视频时极易做出
-一个要跑好几天、无人值守也收不了尾的配置。**本流水线改为自动决定**
-（`pipeline/planner.py`），判据两条：
+**算一遍就懂了**（本机实测吻合）：
 
-1. **片源值不值得修**：编码/容器是否含压缩伪影特征
-   （h264 / wmv3 / mpeg4 / vc1… 或 asf / wmv / avi 容器）；
-2. **时间上跑不跑得起**：单文件预算 = `auto.total_budget_hours ÷ 队列长度`。
+| 片源 | 档位 | 计算 | 预计 | 实测 |
+| --- | --- | --- | --- | --- |
+| 712×400 / 50 帧 | 仅 2x | 50 × (0.0465 × 1.139) | 2.6 s | 2.65 s |
+| 712×400 / 50 帧 | 1x+2x | 50 × (0.053 + 1.64 × 0.285) | 26 s | 25.98 s |
+| 1024×768 / 2x / 25 分钟 | 仅 2x | 7500 × (0.0465 × 3.145) | 18 min | ≈20 min |
+| 1024×768 / 2x / 40 分钟 | **1x+2x** | 12010 × (0.146 + 1.64 × 0.786) | 4.8 h | ≈5.5 h |
 
-队列越长 → 单文件预算越小 → 自动退回快速档。决策会写进
-`logs/jobs/<id>.log`，同时**自动推导该任务的 RVE `timeout`**
-（预估 × 3，取下限 4h），不再有「改了档位忘了同步 timeout、RVE 被杀」的坑。
+### 3.2 三步估算你的机器能跑多快
 
-**开跑前先看数**（只探测、不处理任何文件）：
+1. **先跑自检标定**（换显卡/换分辨率档必须做）：
 
-```bash
-./.venv/Scripts/python.exe main.py --only 剧集 estimate
-```
+   ```powershell
+   .\.venv-rve\Scripts\python.exe scripts\verify_cuda.py --bench
+   ```
+   它会打印每帧实测耗时；用 `秒/帧 ÷ 输出百万像素` 反推 `upscale_s_per_mp`。
 
-输出示例（真实数据）：
+2. **写回配置**：
 
-```text
-文件数            : 1
-总时长            : 1.1 小时
-单文件时间预算    : 12.00 小时（总预算 12.0h ÷ 1）
-画质 AI 完整档     : 14.8 小时（1x+2x）
-画质 AI 快速档     : 1.5 小时（仅 2x）
-自动档位          : 2x（仅超分）
-  理由：超预算：完整修复约 14.8h > 12.0h，退回 2x（约快 9 倍）
-```
+   ```yaml
+   video_repair:
+     auto:
+       upscale_s_per_mp: 0.0465       # 用你的实测值替换
+       decompress_s_per_mp: 1.64
+   ```
 
-按此模型推算 30 个文件的批量（单帧成本在本机标定，误差 <3%）：
+3. **用命令看整批结论**（不处理任何文件）：
 
-| 片源 | 完整档 | 快速档 | 自动选定 |
+   ```powershell
+   python main.py estimate --only 课程
+   ```
+   输出含：总时长、单文件预算、完整档/快速档预估小时数、逐文件档位与理由。
+
+### 3.3 不同设备的粗略倍率（以本机 4060 Laptop 为 1×）
+
+| 设备档位 | 相对速度 | 68 分钟 712×400 片源（仅 2x） | 建议 |
 | --- | --- | --- | --- |
-| 30 × 35min @712×400 | 227.8 h | **23.4 h** | 快速档 |
-| 30 × 35min @720p（2x 超分） | 736.5 h | **75.2 h** | 快速档 |
-| 30 × 35min @1080p（light，不超分） | 1530.2 h | **42.4 h** | 快速档 |
-| 30 × 60min @1080p | 2623.1 h | **72.6 h** | 快速档 |
+| RTX 4090 / 4080 台式 | 2.5 ~ 3.5× | 30 ~ 40 分钟 | 可考虑 4x 模型 |
+| RTX 4070 / 4060 台式 | 1.4 ~ 2× | 45 ~ 65 分钟 | 默认档位即可 |
+| **RTX 4060 Laptop（本机）** | **1×** | **约 1.5 小时** | 默认档位；`tile=512` 更稳 |
+| GTX 1660 / 6G | 0.4 ~ 0.6× | 2.5 ~ 4 小时 | 关掉 1x 修复，只用 2x |
+| 纯 CPU（无独显） | 0.03 ~ 0.05× | 2 ~ 3 天 | 只用 `--tier light` 或 `--no-ai` |
+| Apple Silicon（M 系，MPS） | 0.3 ~ 0.6× | 3 ~ 5 小时 | 需 `device: mps` |
 
-> 1080p 反而比 720p 快，是因为 `light` 档不超分（输出仍是 1080p），
-> 而 `course_720` 档要 2x 超分（输出 1440p，像素数 ×4）。
+> 这些是**数量级参考**：真正准的是你自己的 `--bench` 结果。内存不足时（见 5.2）
+> 实际速度会更差——因为会被崩掉重跑。
 
-想固定行为也很简单：
+### 3.4 影响速度的因素（按影响从大到小）
 
-```yaml
-video_repair:
-  auto:
-    enabled: false        # 关掉自动 → 完全按 models 配置执行
-    total_budget_hours: 12
+1. **档位**：1x 压缩修复比 2x 超分慢约 9~35 倍（这是最大变量）；
+2. **分辨率与帧率**：成本 ≈ 输出像素数 × 帧数，成正比；
+3. **GPU 型号与功耗模式**（笔记本的静音/性能模式差可达 2 倍）；
+4. **`tile`**：分块推理会把大图拆小，速度略降但峰值内存明显下降；
+5. **转码阶段**：`hevc` + `cpu_preset` / `crf`，以及是否有 QSV/NVENC；
+6. **磁盘/内存压力**：内存不足会触发跳过与重排，总体变慢。
+
+---
+
+## 4. 全部可修改参数
+
+> 全部写在 `config.yaml`；以 `./` 开头的路径**相对配置文件所在目录**解析。
+> 「推荐」列是本机 16GB / 8GB 显存 / 50GB 磁盘下的建议值。
+
+### 4.1 路径与资源
+
+| 参数 | 作用 | 取值 | 默认 | 推荐 |
+| --- | --- | --- | --- | --- |
+| `paths.input` | 源视频目录（只读，绝不修改） | 相对/绝对路径 | `./input` | 保持 |
+| `paths.work` | 中间产物目录 | 同上 | `./work` | 与 `input` 同盘（重命名更快） |
+| `paths.output` | 成片目录（镜像 `input` 子目录结构） | 同上 | `./output` | 保持 |
+| `paths.failed` | 失败隔离目录 | 同上 | `./failed` | 保持 |
+| `paths.logs` | 日志目录 | 同上 | `./logs` | 保持 |
+| `paths.database` | SQLite 作业库（断点续跑依据） | 同上 | `./pipeline.db` | 不要放网络盘 |
+| `resources.cpu_cores` | 声明的 CPU 核数（仅记录） | 正整数 | `22` | 按实机改 |
+| `resources.ram_total_gb` | 声明的内存总量（仅记录/校验） | 正整数 | `16` | 按实机改 |
+| `resources.ram_soft_limit_percent` | 超过则**禁止启动新阶段**（等待） | 60~99 | `92` | 16GB 机器保持 92；32GB 可降 85 |
+| `resources.ram_hard_limit_percent` | 硬上限（暂停/降级） | 90~99 | `97` | 保持 |
+| `resources.max_video_ai_jobs` | 同时跑几个视频 AI | **1** | `1` | 不要改（显存不够只会更慢） |
+| `resources.max_audio_jobs` | 同时跑几个音频 AI | 1~2 | `1` | 保持 |
+| `resources.max_transcode_jobs` | 同时跑几个转码 | 1~2 | `1` | 保持 |
+| `scheduler.max_active_video_workspaces` | 同时占用工作区的视频数 | **1** | `1` | 不要改 |
+| `scheduler.poll_interval_seconds` | 主循环轮询间隔 | ≥5 | `10` | 保持 |
+
+### 4.2 磁盘（第一优先级调度约束）
+
+| 参数 | 作用 | 取值（GB） | 默认 | 推荐 |
+| --- | --- | --- | --- | --- |
+| `disk.total_available_gb` | 声明可用空间（仅记录） | 正整数 | `50` | 按实机 |
+| `disk.safe_start_gb` | ≥此值才启动**新**任务 | — | `30` | 保持 |
+| `disk.pause_new_jobs_gb` | 低于此值只继续已开始的任务 | — | `20` | 保持 |
+| `disk.cleanup_gb` | 低于此值触发紧急清理 | — | `15` | 保持 |
+| `disk.emergency_stop_gb` | 低于此值整条流水线暂停 | — | `10` | 保持 |
+| `disk.safety_margin_gb` | 单文件空间评估的安全余量 | — | `8` | 保持 |
+| `disk.video_temp_multiplier` | 单文件空间预估系数（源 × 该值） | 1.0~3.0 | `1.5` | 长片多可调 2.0 |
+| `disk.audio_temp_multiplier` | 音频中间文件系数 | — | `0.2` | 保持 |
+| `disk.output_multiplier` | 成片大小系数 | — | `1.2` | 保持 |
+
+### 4.3 视频 AI 修复（`video_repair`）
+
+| 参数 | 作用 | 取值 | 默认 | 推荐 |
+| --- | --- | --- | --- | --- |
+| `enabled` | 是否启用画质 AI | `true`/`false` | `true` | 有 GPU 就 true |
+| `tier` | 修复档位 | `auto` `light` `standard` `full` | `auto` | 批量用 `auto` |
+| `backend` | 适配器后端 | `real-video-enhancer` / `none` | 前者 | 保持 |
+| `infer_backend` | RVE 推理后端 | `pytorch` `ncnn` `tensorrt` | `pytorch` | 保持 |
+| `device` | 推理设备 | `cuda` / `cpu` | `cuda` | 有 N 卡用 cuda |
+| `precision` | 精度 | `auto` `float16` `float32` | `auto` | 保持 |
+| `gpu_index` | 用哪块卡 | 0~n | `0` | 保持 |
+| `deblock` | 是否允许传压缩修复模型 | `true`/`false` | `true` | 保持（真实是否用由 planner 定） |
+| `upscale` | 是否超分 | `true`/`false` | `true` | 保持 |
+| `scale_mode` | 倍率策略 | `auto` `1x` `2x` `4x` | `auto` | 不要盲目 4x |
+| `interpolation` | 是否插帧 | `true`/`false` | `false` | 保持 false |
+| **`tile`** | 分块推理尺寸 | `0`（整帧）/ `256` / `512` / `128`(CPU) | `512` | 内存紧张保持 512；显存充足可 0 |
+| `crf` | RVE 中间产物质量 | 0~23 | `16` | 保持（中间产物要够好） |
+| `encoder` | 中间产物编码器 | `libx264` / `libx265` | `libx264` | 保持 |
+| `timeout_seconds` | RVE 超时**下限** | ≥3600 | `14400` | 不用改（实际值由 planner 推） |
+| `executable` | RVE 解释器 | 路径 | `./.venv-rve/Scripts/python.exe` | 保持 |
+| `ffmpeg_path` | RVE 内部调用的 ffmpeg | 路径 | `./.tools/ffmpeg/ffmpeg.exe` | 保持 |
+| `extra_args` | 追加到 RVE 命令行的参数 | 列表 | 见下 | **已内置降内存参数，勿删** |
+| `auto.enabled` | 是否自动决定 1x 修复 | `true`/`false` | `true` | 保持 true |
+| `auto.total_budget_hours` | 单次 run 的画质 AI 总预算 | 1~100 | `12` | 想让它更常用完整档就调大 |
+| `auto.upscale_s_per_mp` | 超分速度标定 | 正数 | `0.0465` | **用 --bench 复标定** |
+| `auto.decompress_s_per_mp` | 压缩修复速度标定 | 正数 | `1.64` | 同上 |
+| `auto.timeout_safety_factor` | 超时安全系数 | 1.5~5 | `3.0` | 保持 |
+| `models.upscale."2x"` | 2x 超分模型路径 | 路径 | `./tools/models/2x_OpenProteus...pth` | 保持 |
+| `models.decompress` | 1x 压缩修复模型路径（空=不具备该能力） | 路径/`null` | `./tools/models/1xDeH264_realplksr.pth` | 保持 |
+
+> `extra_args` 当前含一条关键设置：`--custom_encoder "-c:v libx264 -threads 6 -crf 16
+> -b:a 192k -c:a aac -c:s copy"`。RVE 默认不限制帧线程数，编码 ffmpeg 峰值内存会到
+> 1.58 GB；限到 6 线程后约 1.2 GB，是**避免长片整机内存耗尽**的关键一手。
+> 注意：一旦传 `--custom_encoder`，RVE 不再拼接预设编码参数，所以这串必须写全。
+
+### 4.4 音频（`audio_repair`）
+
+| 参数 | 作用 | 取值 | 默认 | 推荐 |
+| --- | --- | --- | --- | --- |
+| `enabled` | 是否启用 AI 降噪 | `true`/`false` | **`false`** | **保持 false**（见 5.7） |
+| `backend` | 降噪后端 | `deepfilternet` `clearervoice` `none` | `deepfilternet` | 保持 |
+| `sample_rate` | 处理采样率 | `44100`/`48000` | `48000` | 保持 |
+| `bitrate` | 输出音频码率 | 如 `320k` | `320k` | 保持 |
+| `max_segment_seconds` | 长音频自动分段上限 | 30~600 | `120` | 内存紧张可降 60 |
+| `crossfade_seconds` | 分段交叉淡化 | 0~0.5 | `0.05` | 保持 |
+
+### 4.5 输出 / 编码 / 重试 / 校验 / 其它
+
+| 参数 | 作用 | 取值 | 默认 | 推荐 |
+| --- | --- | --- | --- | --- |
+| `output.*` | 见 [2.3](#23-输出相关参数) | — | mp4/hevc/aac | — |
+| `encoder.prefer` | 编码后端优先级 | 列表 | `["qsv","nvenc","cpu"]` | 保持 |
+| `encoder.qsv_preset` | QSV 速度档 | `fast`~`veryslow` | `medium` | 想快用 `fast` |
+| `encoder.cpu_preset` | CPU 速度档 | `ultrafast`~`veryslow` | `medium` | 想快用 `fast` |
+| `encoder.crf` | 转码质量（越小越好越大文件） | 18~28 | `23` | 保持 |
+| `retry.max_attempts` | 单文件最大尝试次数 | 1~5 | `3` | 内存紧张的机器保持 3 |
+| `retry.backoff_seconds` | 重试间隔 | ≥0 | `30` | 保持 |
+| `verify.duration_tolerance_seconds` | 时长偏差容忍 | ≥0 | `2` | 保持 |
+| `verify.require_video` / `require_audio` | 必须含视频/音频流 | `true`/`false` | `true` | 保持 |
+| `verify.min_size_bytes` | 成片最小字节数 | ≥1 | `10000` | 保持 |
+| `intermediate.lossless` | 是否用 FFV1+PCM 无损中间文件 | `true`/`false` | `false` | 保持（会占巨大磁盘） |
+| `input.extensions` | 识别哪些后缀 | 列表 | 10 种常见视频 | 按需增删 |
+| `profiles.auto_select` | 按分辨率自动选处理策略 | `true`/`false` | `true` | 保持 |
+| `profiles.overrides` | 按文件名强制策略 | 字典 | `{}` | 特例文件用 |
+| `dashboard.port` | 看板端口 | 1024~65535 | `8765` | 冲突时改 |
+| `dashboard.interval_seconds` | 看板刷新 | ≥1 | `3` | 保持 |
+
+---
+
+## 5. 常见问题排查与解决
+
+> 排查顺序建议：`main.py status` → `logs\jobs\<id>.log`（单文件全量输出）→
+> `logs\pipeline.log`（调度器全景）→ `logs\watchdog.log`（是否被杀/卡死）→
+> `pipeline.db`（job_stages / events 两个表）。
+
+### 5.1 现象：`找不到可执行文件: ffmpeg`
+
+- **原因**：`FFmpegAdapter` 默认用裸命令名 `ffmpeg`，能否找到取决于**启动方式**：
+  双击 `run.bat`（走 `bootstrap.ps1`，会把 `.tools\ffmpeg` 加进 PATH）没问题；
+  直接 `python main.py run` 就不在 PATH 上。实测一次报废 4 个视频。
+- **处置**：新版已在 `adapters/_toolpath.py` 内置兜底（PATH 找不到就回落到仓库自带
+  `.tools\ffmpeg`），任何启动方式都可用。若仍报错，检查 `.tools\ffmpeg\ffmpeg.exe`
+  与 `ffprobe.exe` 是否存在：`python main.py doctor`。
+
+### 5.2 现象：RVE 报 `Unable to allocate 2.25 MiB` 或 `MemoryError`，任务最终 `FAILED_FINAL`
+
+- **完整错误形态**（真实日志）：
+
+  ```
+  Exception in thread Thread-2 (read_frames_into_queue):
+  numpy._core._exceptions._ArrayMemoryError: Unable to allocate 2.25 MiB
+      for an array with shape (768, 1024, 3) and data type uint8
+  File "...\tools\backend\src\FFmpegBuffers.py", line 125, in read_frame
+      rgb_image = cv2.cvtColor(yuv_image, cv2.COLOR_YUV2RGB_I420)
+  SystemError: <built-in function cvtColor> returned a result with an exception set
+  BACKEND: [Errno 22] Invalid argument
+  ```
+
+- **根因**：**整机内存耗尽**（不是显存、也不是"无限缓存"——读队列本身有界
+  `Queue(maxsize=25)`）。RVE 读帧线程连 2.25 MB 都申请不到；线程一死，后端就报
+  "FFmpeg failed to render the video" 并以 rc=1 / 0xC0000005 退出。
+- **放大因素**：RVE 自己拉起的编码 ffmpeg 默认**不限制帧线程数**（按核数自动，本机
+  22 核），实测峰值 1.58 GB，是整条流水线里最大、也是唯一可调的内存开销。
+- **已内置的处置**（三层，无需你手工干预）：
+  1. 降到 `tile: 512` 分块推理；
+  2. `extra_args` 里限制编码线程 `-threads 6`（峰值 1.58 → 1.2 GB）；
+  3. 代码把「系统内存不足」单独分类：**立即清干净工作区 → 把任务降到队尾 →
+     跑下一个**，不再原地连撞 3 次把队列停住；重跑机会仍计入 retry 预算。
+- **你还能做的**：关掉浏览器/IDE 等占内存的程序；`resources.ram_soft_limit_percent`
+  调到 88 让流水线更早开始等资源；长片源考虑 `--tier standard`（只超分）。
+
+### 5.3 现象：`中间文件 ...video_ai.mp4 仍被其他进程占用，无法清理（WinError 32）`
+
+- **原因**：RVE 崩溃/退出时它的 ffmpeg 子进程还活着几秒并占着产物；删除失败会让
+  **后续每一个任务**都在同一行秒失败（实测一次性报废 34 个任务）。
+- **处置**：已内置 `unlink_with_retry`（等待句柄释放，最长 60 秒，指数退避），仍失败
+  则抛**可重试**错误交给调度器，而不是直接判死。
+- **手工兜底**：`Get-Process ffmpeg,python | Where-Object { $_.Path -like "*video_pipeline*" } | Stop-Process -Force`，
+  然后 `python main.py retry` + `run`。
+
+### 5.4 现象：隔几小时回来发现进度一动没动
+
+- **原因**：调度器进程被系统在内存压力下**静默杀掉**（日志无任何退出记录，系统事件
+  里也没有崩溃）——实测一次让队列停了 2 小时。
+- **处置**：用 [1.5 的守护脚本](#15-无人值守守护脚本)，它每 5 分钟巡检并自动拉起
+  （日志里会看到「调度器已不在，清理孤儿进程后重启」）。
+
+### 5.5 现象：RVE 还活着，但输出文件长时间一个字节不涨
+
+- **原因**：RVE 挂死（常见于崩溃重试后的新进程），调度器会一直等到 timeout（默认
+  推导值可能 4 小时）。
+- **处置**：守护脚本会把「输出 15 分钟无增长（**含输出文件根本没出现**）」判为卡死，
+  终止该 RVE 并把任务降到队尾。若没开守护，手工杀掉该 RVE 即可，调度器会走正常
+  失败重试流程。
+
+### 5.6 现象：进度条长时间不动 / 显示"剩余 8 分钟"但跑了 40 分钟
+
+- **原因**：早期版本在长阶段里进度退化成常量（阶段时间戳被 `COALESCE` 冻结）。
+- **处置**：已修（阶段内进度改为两段软爬升 + 显示"最后更新于 N 秒前"）。若看板仍是
+  旧页面，**刷新一次浏览器**（前端 JS 有改动）。
+
+### 5.7 现象：成片音频"模糊、背景音没了"
+
+- **原因**：启用了 DeepFilterNet。它是**语音增强**模型，会把环境音/音乐当噪声整体
+  重合成。实测（录像01 同一 60 秒段落）：3–6 kHz 能量占比 26.2% → 10.7%，频谱质心
+  1754 → 1171 Hz，波形相关系数 -0.001（几乎零相关）。
+- **处置**：保持 `audio_repair.enabled: false`（默认）。已产出的成片可零重编码修复：
+  `-c:v copy` 复制视频流 + 换回源音频重新封装，无需重跑 AI。
+
+### 5.8 现象：任务变 `WAIT_DISK` 或整条流水线暂停
+
+- **原因**：可用磁盘低于配置阈值（`disk.*`）。
+- **处置**：`python main.py cleanup` 清理 `work/`；确认 `output/` 成片已备份后可移走；
+  阈值太保守可按 [4.2](#42-磁盘第一优先级调度约束) 调整。
+
+### 5.9 现象：`verify` 报某个成片失败
+
+- **原因**：时长偏差超 `duration_tolerance_seconds`、缺视频/音频流、或文件小于
+  `min_size_bytes`（通常是导出中途被杀）。
+- **处置**：`python main.py retry` 该任务重跑；若反复失败，保留
+  `work/current/` 现场并看 `logs\jobs\<id>.log` 尾部的 ffmpeg stderr。
+
+### 5.10 现象：日志里出现「删除 xxx 失败（等待 60s 后仍被占用）」
+
+- **原因**：有孤儿进程还握着文件；或杀毒/同步软件在扫描。
+- **处置**：见 5.3。若频繁出现，检查是否有别的程序（备份、云盘同步）在扫描
+  `video_pipeline` 目录——批量处理期间建议排除该目录。
+
+### 5.11 现象：想只重跑失败的那几个
+
+```powershell
+python main.py status        # 看 FAILED_FINAL 有哪些
+python main.py retry         # 全部重置为待跑
+python main.py run           # 续跑（已完成阶段不会重复执行）
 ```
 
-复标定（换显卡/换分辨率档位后）：`scripts/verify_cuda.py --bench`，
-把结果填回 `video_repair.auto.upscale_s_per_mp` / `decompress_s_per_mp`。
+若只想重跑某一个：把 `input/` 里该文件之外的其他文件临时移走，再 `scan`（扫描只
+建新任务，不动已完成记录），然后 `run`。
 
-## 性能实测与已知限制
+### 5.12 现象：`doctor` 通过但 AI 阶段没生效
 
-在 16GB RAM + 8GB 显存档位上实测（源 712×400 / 25fps / 68 分钟的剧集）：
+- 检查 `logs\jobs\<id>.log` 里这一行：`自动档位：...` 与 `RVE 参数：超分 ..., 压缩修复 ...`。
+  若显示「未配置 1x 压缩修复模型」，说明 `models.decompress` 指向的模型不存在；
+  若显示「片源编码 xxx 无压缩伪影特征」，说明 planner 判定不需要 1x 修复（正常）。
+- 想强制完整修复：`--tier full`；想强制只超分：`--tier standard`。
 
-| 阶段 | 实测吞吐 | 整集(4088s)外推 |
-| --- | --- | --- |
-| 画质 AI：1x 压缩修复 + 2x 超分 | ~1.9 fps | **约 14.8 小时** |
-| 画质 AI：仅 2x 超分（关掉压缩修复模型） | ~18.9 fps | 约 1.5 小时 |
-| 音质 AI：DeepFilterNet（**默认关闭**） | ~10× 实时 | 约 7 分钟 |
+---
 
-结论与建议：
+## 附录 A 目录结构
 
-- **瓶颈是压缩修复模型（RealPLKSR），比超分模型慢约 10 倍**。是否启用由
-  上面的「自动档位」决定，不必手工改配置。
-- 成本模型的**分辨率线性外推是一阶近似**（只在 712×400 上标定过）。
-  1080p 那段估算偏保守，实际 CUDA 大分辨率下单位像素开销通常更低。
-- CPU 推理（`device: cpu`）比 CUDA 慢 20~50×，仅适合做功能验证：
-  2 秒片段 CPU 需 365~552s。
-- 编解码后端把结果编码成 `libx264` 再由流水线用 QSV 转 HEVC，
-  比让 RVE 自己编 libx265 更快（libx265 在 CPU 上是主要瓶颈）。
+```
+video_pipeline/
+├─ main.py                 CLI 入口（scan/run/status/estimate/tiers/doctor/verify/…）
+├─ config.yaml             全部可调参数（带中文注释）
+├─ run.bat / scripts/      双击启动与安装脚本
+│   ├─ bootstrap.ps1       一键引导：装依赖、找 FFmpeg、问档位、跑 scan+run
+│   ├─ setup_ai_tools.ps1  安装 RVE / DeepFilterNet（-Cuda 装 CUDA 版 torch）
+│   ├─ verify_cuda.py      GPU 自检与速度标定（--bench）
+│   └─ watchdog_pipeline.ps1  无人值守守护（详见 1.5）
+├─ pipeline/               调度器与基础设施
+│   ├─ scheduler.py        资源感知调度、断点续跑、失败隔离（核心）
+│   ├─ planner.py          自动档位与耗时成本模型
+│   ├─ runner.py           子进程封装 + OOM 分类
+│   ├─ database.py         SQLite 作业库（jobs / job_stages / events）
+│   ├─ cleanup.py          临时文件清理（含句柄重试）
+│   ├─ progress.py / dashboard.py / monitor_tui.py   进度计算与两种可视化
+│   └─ verifier.py         成片 ffprobe 校验
+├─ adapters/               RVE / FFmpeg / FFprobe / DeepFilterNet 适配器
+├─ profiles/               按分辨率的处理策略
+├─ tests/                  pytest 用例（当前 85 passed / 3 skipped）
+├─ input/[课程|剧集]/       源视频（只读）
+├─ output/[课程|剧集]/      成片（镜像输入子目录）
+├─ failed/job_XXXX/        失败隔离的中间产物
+├─ logs/                   运行日志、守护日志、未导出报告
+├─ work/current/           单任务工作区（同一时间只服务一个视频）
+└─ .tools/ffmpeg/          仓库自带 FFmpeg/FFprobe
+```
 
-### 音质 AI 为什么默认关闭（实测结论）
+## 附录 B 错误码与异常分类
 
-DeepFilterNet 是**语音增强（speech enhancement）**模型，设计目标是「提取人声、
-抑制非语音」。对课程录像这类需要完整声场的素材，它不是按 dB 衰减噪声，而是
-**整体重新合成**一段语音——环境音、音乐、混响、演示音频都会被当作噪声丢弃。
-
-对 录像01 同一 60 秒段落做三路对比（源 / 不做 DFN 的对照 / DFN 处理后）：
-
-| 指标 | 不做 DFN | DFN 处理后 | 说明 |
+| 异常 | 触发条件 | 是否重试 | 处置 |
 | --- | --- | --- | --- |
-| 3–6 kHz 能量占比 | 26.21% | **10.68%** | 语音清晰度关键频段被砍掉近 60% → 听感「模糊」 |
-| 频谱质心 | 1754 Hz | **1171 Hz** | 音色整体变闷 |
-| 波形相关系数 | — | **-0.001** | 几乎零相关，证明是「重合成」而非「增强」 |
-| RMS 电平 | -30.1 dB | -34.7 dB | 音量同时变小 |
+| `DependencyError` | 工具/模型缺失、ffmpeg 不可用 | 否 → `FAILED_FINAL` | `doctor` 检查、装依赖 |
+| `ProbeError` | 源文件损坏、ffprobe 无法解析 | 否 | 换源或删除任务 |
+| `GpuOutOfMemoryError` | `cuda out of memory` 等**显存**不足 | 是（降超分倍率重试） | 降 `tile`、降倍率 |
+| `SystemMemoryError` | `MemoryError` / `Unable to allocate` / 0xC0000005 / 0xC0000409 | 是，且**立即让出队列** | 见 5.2 |
+| `ResourceBusyError` | 中间文件被杀不死进程占用 | 是（稍后重试） | 见 5.3 |
+| `DiskSpaceError` | 磁盘不足 / RAM 长时间超软限 | 是 | 见 5.8 |
+| `VerificationError` | 成片校验不通过 | 是 | 见 5.9 |
 
-叠加因素：本批 37 个源片全部是 `mono / 22050 Hz / 20 kbps` 的 wmav2（电话级音质），
-而 DFN 在 48 kHz 上训练，对这类低采样率低码率输入处理异常。
-调 `--atten-lim` 无效——问题出在输出是重合成，不是衰减量不够。
+## 附录 C 实测性能基准
 
-**因此默认改为不做音频 AI**：只把源音频重编码为 AAC（声场百分之百保留），
-代价是源本身的底噪与压缩伪影也一并保留。
+| 项目 | 实测值（本机：22 核 / 16GB / RTX 4060 Laptop 8G） |
+| --- | --- |
+| 2x 超分（712×400→1424×800） | 0.053 秒/帧（≈19 帧/秒） |
+| 2x 超分（1024×768→2048×1536） | 0.146 秒/帧（≈6.8 帧/秒） |
+| 1x 压缩伪影修复（附加） | 1.64 秒/百万输入像素（约为超分的 9 倍） |
+| RVE 进程峰值内存 | 约 1.0~1.4 GB |
+| 编码 ffmpeg 峰值内存 | 1.58 GB（默认线程）→ **1.2 GB（`-threads 6`）** |
+| 转码（HEVC，CPU libx265 medium） | 约 1/3 ~ 1/4 实时 |
+| 一次完整单文件链路（1024×768 / 40 分钟 / 仅 2x） | 约 35 ~ 45 分钟 |
 
-修复已产出成片的办法（不必重跑画质 AI）：把已有成片当中间产物、换回源音频重封装，
-视频流 `-c:v copy` 直接复制，零重编码：
+## 附录 D 修复档位详解
 
-```bash
-ffmpeg -i output/课程/录像01.mp4 -i input/课程/录像01.wmv \
-  -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 320k -ar 48000 \
-  -movflags +faststart -shortest -f mp4 录像01.mp4.partial && mv ...
-```
+| 档位 | 做什么 | 68 分钟 712×400 片源耗时 | 何时用 |
+| --- | --- | --- | --- |
+| `light` | 只转码，不碰画面/声音 | 约 5 分钟 | 只要格式统一；机器无 GPU |
+| `standard` | 2x 超分（+ 音质 AI，当前默认关） | 约 1.5 小时 | **推荐默认**；画质提升与时间平衡 |
+| `full` | 1x 压缩伪影修复 + 2x 超分 | 约 14.8 小时 | 片源块效应明显且不赶时间 |
+| `auto` | 按**片源特征 + 队列长度**自动选 standard/full | 取决于队列 | 批量处理（默认） |
 
-> `-f mp4` 必须显式给出：`.partial` 后缀会让 ffmpeg 无法推断容器格式。
-> 若要重新启用音频 AI，把 `audio_repair.enabled` 改回 `true`，但请先确认素材
-> 不是「人声 + 环境音」的混合型内容。
+`auto` 的判据两条：① 片源编码/容器是否有压缩伪影特征；② 在
+`总预算 ÷ 队列长度` 得到的单文件预算内跑不跑得起完整档。队列越长 → 单文件预算越小
+→ 自动退回快速档，避免做出"要跑好几天"的配置。
 
-#### 修复后的验证（回归基准）
-
-修复后对 4 个成品与各自的源做同段（900s 起 60 秒）频谱对比。其中 录像05 是
-**全程走新配置、由流水线新鲜产出**的，录像01-03 是按上面办法重封装修的——
-两条路径结果一致，说明配置改动在完整链路上生效：
-
-| 文件 | 源质心 | 成品质心 | 源 3–6 kHz | 成品 3–6 kHz | 电平差 | 最大频段偏差 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 录像01 | 1755 Hz | 1754 Hz | 26.23% | 26.20% | -0.01 dB | 0.064 点 |
-| 录像02 | 1591 Hz | 1590 Hz | 19.76% | 19.75% | -0.01 dB | 0.030 点 |
-| 录像03 | 1214 Hz | 1213 Hz | 9.11% | 9.09% | -0.01 dB | 0.016 点 |
-| 录像05 | 1312 Hz | 1311 Hz | 14.62% | 14.60% | -0.00 dB | 0.045 点 |
-
-全部文件最大频段偏差 **0.064 个百分点**（DFN 版是 15.53 点，改善约 240 倍），
-频谱质心差均 ≤ 1 Hz。四个源的频谱差异很大（录像03 的 300–1k 占 55.32%，
-录像01 只占 41.04%），而成品**各自精确跟随自己的源**——这反证处理链里已无
-任何统一的降噪/EQ。残留的极小负偏差（-0.01 dB 量级）是 AAC 有损编码在
-高频段的正常损耗，不是处理引入的失真。
-
-日后改动音频链后，可用同样方法回归：取同一段 60 秒，比较成品的频谱质心与
-3–6 kHz 占比是否仍与源一致。
-
-### DeepFilterNet 长音频内存问题（已修复：自动分段；但默认不启用）
-
-DeepFilterNet 会把整个文件读成浮点数组，峰值内存远高于数据量本身。实测
-（16 GB 机器、空闲约 4 GB 时）：
-
-| 输入 | 数据量(float32) | 结果 |
-| --- | --- | --- |
-| 68min 整文件 | 1.57 GB | ❌ 单次分配 3.15 GB 失败 → `FAILED_FINAL` |
-| 600s 段 | 230 MB | ❌ 仍 OOM |
-| 60s 段 | 23 MB | ✅ 通过 |
-
-**已实现的修复**（`adapters/deepfilternet.py`，不改第三方包源码）：
-
-1. 超出「按下述上限与可用内存算出的单段时长」的音频**自动分段**：
-   逐段抽出 → 逐段跑 DFN → 段间 50ms 交叉淡化 → **长度对齐回原始帧数**
-   （保证输出与源时长偏差 ≤ 2s，可通过校验）；
-2. **拼接走流式写盘**：逐段读入、与上一段尾部交叉淡化后立即写出，
-   内存峰值只有「单段 + 一个重叠窗口」，不随总时长增长；先写 `.partial`
-   再原子改名，中途失败不会留下看似成品的残文件；
-3. **OOM 自校准**：若某次分段仍因内存不足失败，自动把段长对半降低后整体重试
-   （直到 30 秒）。因此换机器、换后台负载都无需手工调参；
-4. 短音频（≤ 单段上限）仍走原来的一次性路径，行为不变。
-
-相关配置（`config.yaml`）：
-
-```yaml
-audio_repair:
-  max_segment_seconds: 120    # 单段最长 2 分钟；调小更省内存、段边界更多
-  crossfade_seconds: 0.05     # 段间交叉淡化时长
-```
-
-## 常见错误
-
-| 现象 | 原因 | 处理 |
-| --- | --- | --- |
-| `FAILED_FINAL: ffprobe 无法读取` | 源文件损坏 | 换源文件后 `python main.py retry` |
-| `GPU 显存不足` | 超分倍率过高 | 程序已自动降倍率重试；仍失败则在 config 调低 |
-| 任务长时间 `WAIT_DISK` | 磁盘低于阈值 | 清理磁盘或将 output 转移到外部存储 |
-| `编码后端 hevc_qsv 失败` | QSV 驱动/硬件不可用 | 自动降级 NVENC/CPU，无需干预 |
-| `REAL-Video-Enhancer 未安装` | AI 工具缺失 | 配置 executable 路径，或暂时 `enabled: false` |
-
-## GPU 检查
-
-```bash
-nvidia-smi              # 确认能看到你的 NVIDIA GPU 与显存容量
-python main.py doctor   # 会检查 VRAM 与 NVENC
-```
-
-## QSV 检查
-
-```bash
-ffmpeg -encoders | findstr qsv   # 应有 hevc_qsv
-python main.py doctor
-```
-
-注意：`ffmpeg -encoders` 列出 `hevc_qsv` ≠ 硬件可用（可能只是编译了
-libmfx）。本系统在**运行失败时也会自动降级**，不受误报影响。
-
-## 错误码 / 异常分类
-
-| 异常 | 含义 | 是否重试 |
-| --- | --- | --- |
-| `ProbeError` | 源文件损坏/无法解析 | 否 → FAILED_FINAL |
-| `DependencyError` | 外部工具缺失 | 否 → FAILED_FINAL |
-| `GpuOutOfMemoryError` | 显存不足 | 是（降参数后） |
-| `ExternalToolError` | 外部命令非零退出 | 是 |
-| `DiskSpaceError` / `EmergencyStopError` | 磁盘不足 | 任务 WAIT_DISK / 流水线暂停 |
-| `VerificationError` | 输出未通过校验 | 是 |
-| `ConfigError` | 配置非法 | 否 |
+---
 
 ## 测试
 
-```bash
-python -m pytest tests/ -v
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -q     # 当前：85 passed, 3 skipped
 ```
 
-59 项测试：状态机迁移、SQLite 断点恢复、磁盘阈值、文件名清洗、
-校验器、profile 选择，以及基于真实 FFmpeg 的端到端测试
-（完整跑通 scan → run → DONE → work 清空）。
+覆盖：调度器选任务/磁盘约束/失败隔离/断点续跑、内存错误让出队列、隔离产物恢复、
+工具路径兜底、进度与 ETA 计算、校验器、文件名去重、磁盘管理器。
