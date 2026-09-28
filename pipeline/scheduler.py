@@ -25,7 +25,8 @@ from .config import Config
 from .database import Database
 from .disk_manager import DiskManager, DiskState
 from .errors import (DependencyError, DiskSpaceError, EmergencyStopError,
-                     GpuOutOfMemoryError, PipelineError, ProbeError)
+                     GpuOutOfMemoryError, PipelineError, ProbeError,
+                     SystemMemoryError)
 from .filename import unique_output_path
 from .logger import get_job_logger, job_log_path
 from .planner import RepairPlanner
@@ -183,6 +184,7 @@ class Scheduler:
         job = self.db.get_job(job.job_id)  # 刷新
 
         workspace = self.cleaner.prepare_current()
+        self._restore_quarantine(job, jlog)
         self.db.set_workspace(job.job_id, str(workspace))
         log_file = job_log_path(self.log_dir, job.job_id)
 
@@ -493,7 +495,14 @@ class Scheduler:
 
     # ------------------------------------------------------------------ #
     def _handle_failure(self, job: Job, exc: Exception) -> None:
-        """失败处理（需求 #23）：可重试 → RETRY_PENDING；否则 FAILED_FINAL。"""
+        """失败处理（需求 #23）：可重试 → RETRY_PENDING；否则 FAILED_FINAL。
+
+        系统内存不足（SystemMemoryError）单独走一条路：**立即让出队列**。
+        RVE 是在跑了十几分钟后才崩的，若照常连续重试，同一个文件会反复崩 3 次，
+        整条队列陪着停将近一小时；而崩溃后内存条件并没有变，重试成功的概率也不高。
+        所以这里把任务降到队尾重新排队，先把后面能跑的任务推完，之后内存宽松了
+        再回来跑它。重跑机会仍计入 retry 预算，队列一定会收敛、不会循环。
+        """
         jlog = get_job_logger(self.log_dir, job.job_id)
         jlog.error("任务失败: %s", exc)
         self.db.log_event(job.job_id, "ERROR", str(exc))
@@ -503,8 +512,19 @@ class Scheduler:
         retryable = getattr(exc, "retryable", True)
         if isinstance(exc, DependencyError):
             retryable = False
+
+        memory_stall = isinstance(exc, SystemMemoryError)
+        if memory_stall:
+            # 先把工作区清干净：RVE 崩溃时它的 ffmpeg 子进程可能仍持有中间文件，
+            # 不清掉会让**下一个**任务卡在 unlink 上（历史上曾连锁失败 34 个任务）。
+            # unlink_with_retry 会等句柄释放（最长 60s），这是必要的等待而非停顿。
+            self.cleaner.cleanup_current(logger=jlog)
+            jlog.warning("内存不足 → 跳过本任务，排到队尾后再跑（不阻塞队列）")
+
         if retryable and job.retry_count < self.max_attempts - 1:
             self.db.increment_retry(job.job_id)
+            if memory_stall:
+                self.db.set_priority(job.job_id, -1)
             self.db.update_status(job.job_id, JobStatus.RETRY_PENDING,
                                   error=str(exc))
             jlog.warning("进入 RETRY_PENDING (第 %d 次)", job.retry_count + 1)
@@ -526,3 +546,36 @@ class Scheduler:
                         p.replace(dst / p.name)
         except OSError as exc:
             jlog.warning("隔离失败文件时出错: %s", exc)
+
+    def _stage_artifacts(self) -> list[tuple[Stage, str]]:
+        """工作区里各阶段的中间产物名（必须与各 _stage_* 的实现保持一致）。"""
+        return [
+            (Stage.REPAIR_VIDEO, "video_ai.mp4"),
+            (Stage.REPAIR_AUDIO, "audio_clean.wav"),
+            (Stage.TRANSCODE, f"transcoded.{self.cfg.output_ext}"),
+        ]
+
+    def _restore_quarantine(self, job: Job, jlog) -> None:
+        """把上次失败隔离到 failed/<job_id>/ 的中间产物搬回工作区。
+
+        没有这一步，"失败隔离 + 重跑"会让已经跑完的 AI 阶段白跑一遍——产物还躺在
+        failed/ 里，而断点续跑只认工作区里的文件（实测 REPAIR_VIDEO 一次约
+        25~30 分钟）。只搬**库里确实是 DONE** 的那个阶段的产物，因此不会把
+        崩溃留下的半成品复活成"已完成"。
+        """
+        src_dir = self.failed_dir / f"job_{job.job_id:04d}"
+        if not src_dir.is_dir():
+            return
+        current = self.work_dir / "current"
+        for stage, name in self._stage_artifacts():
+            src = src_dir / name
+            if not src.is_file():
+                continue
+            if self.db.get_stage_result(job.job_id, stage) is not StageResult.DONE:
+                continue
+            try:
+                src.replace(current / name)
+                jlog.info("恢复隔离产物 %s（%s 已完成，续跑不再重做）",
+                          name, stage.value)
+            except OSError as exc:
+                jlog.warning("恢复隔离产物 %s 失败: %s", name, exc)

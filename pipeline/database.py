@@ -213,6 +213,16 @@ class Database:
                 "SELECT retry_count FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             return int(row["retry_count"])
 
+    def set_priority(self, job_id: int, priority: int) -> None:
+        """调整调度优先级（越大越先跑，见 _pick_next_job 的排序键）。
+
+        用途：任务因系统内存不足崩溃时把它降到队尾，先跑别的任务，避免同一个
+        文件连续崩 3 次把整条队列卡住（内存条件往往要等别的任务跑完才缓解）。
+        """
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE jobs SET priority=? WHERE job_id=?",
+                               (priority, job_id))
+
     # ------------------------------------------------------------------ #
     # job_stages —— 断点续跑的核心依据之一
     # ------------------------------------------------------------------ #

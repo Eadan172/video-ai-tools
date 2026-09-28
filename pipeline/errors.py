@@ -46,6 +46,16 @@ class GpuOutOfMemoryError(ExternalToolError):
     """GPU 显存不足 —— 需要降低 tile/batch 后重试。"""
 
 
+class SystemMemoryError(ExternalToolError):
+    """系统内存（RAM）不足导致外部工具崩溃 —— 应立即让出队列，稍后再跑。
+
+    与 GpuOutOfMemoryError 的区别：显存不足可以靠降超分倍率/加 tile 在同一台
+    机器上当场解决；而系统内存不足时**重试的环境与刚才完全一样**，连续重试
+    只会在同一个文件上反复崩溃（实测每次要跑十几分钟才崩），把整条队列停住。
+    故调度器对它的处理是"降优先级重新排队 → 先跑别的任务"。
+    """
+
+
 class DiskSpaceError(PipelineError):
     """磁盘空间不足，任务进入 WAIT_DISK 而不是失败。"""
 

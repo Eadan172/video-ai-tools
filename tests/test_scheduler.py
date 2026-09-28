@@ -88,7 +88,79 @@ class TestFailureIsolation:
         assert db.get_job(job.job_id).status is JobStatus.FAILED_FINAL
 
 
+class TestMemoryStall:
+    """系统内存不足必须"让出队列"，不能原地连续重试把整条队列停住。"""
+
+    def test_memory_error_defers_job_to_queue_tail(self, scheduler, db,
+                                                   monkeypatch,
+                                                   tmp_path) -> None:
+        from pipeline.errors import SystemMemoryError
+        scheduler.disk = make_dm(monkeypatch, tmp_path, free_gb=45)
+        stuck = _add(db, "big.mp4")
+        nxt = _add(db, "next.mp4")
+        for job in (stuck, nxt):
+            db.update_status(job.job_id, JobStatus.WAITING)
+            db.update_status(job.job_id, JobStatus.RUNNING)
+        db.update_status(nxt.job_id, JobStatus.RETRY_PENDING)
+
+        scheduler._handle_failure(
+            db.get_job(stuck.job_id),
+            SystemMemoryError("系统内存不足（rc=3221225477）", 3221225477))
+
+        # 仍然可重试（不是 FAILED_FINAL），但已被排到队尾 → 下一个任务先跑
+        assert db.get_job(stuck.job_id).status is JobStatus.RETRY_PENDING
+        assert db.get_job(stuck.job_id).priority < 0
+        assert scheduler._pick_next_job().job_id == nxt.job_id
+
+    def test_memory_error_still_bounded_by_retry_budget(self, scheduler, db,
+                                                        tmp_path) -> None:
+        """让出队列不等于无限重试：重跑机会照样计入 retry 预算。"""
+        from pipeline.errors import SystemMemoryError
+        job = _add(db, "big.mp4")
+        scheduler.max_attempts = 2
+        scheduler._handle_failure(job, SystemMemoryError("内存不足", 3221225477))
+        assert db.get_job(job.job_id).status is JobStatus.RETRY_PENDING
+        scheduler._handle_failure(db.get_job(job.job_id),
+                                  SystemMemoryError("内存不足", 3221225477))
+        assert db.get_job(job.job_id).status is JobStatus.FAILED_FINAL
+
+
 class TestResumeLogic:
+    def test_restores_quarantined_artifact_of_done_stage(
+            self, scheduler, db, project_dir) -> None:
+        """隔离出去的中间产物要能搬回来 —— 否则续跑会把已完成的 AI 阶段重做一遍。"""
+        import logging
+        job = _add(db, "a.mp4")
+        db.set_stage_result(job.job_id, Stage.REPAIR_VIDEO, StageResult.DONE)
+        src = project_dir / "failed" / f"job_{job.job_id:04d}"
+        src.mkdir(parents=True)
+        (src / "video_ai.mp4").write_bytes(b"x")
+        (project_dir / "work" / "current").mkdir(parents=True, exist_ok=True)
+
+        scheduler._restore_quarantine(db.get_job(job.job_id),
+                                      logging.getLogger("test"))
+
+        restored = project_dir / "work" / "current" / "video_ai.mp4"
+        assert restored.read_bytes() == b"x"
+        assert not (src / "video_ai.mp4").exists()
+
+    def test_keeps_half_product_in_quarantine(self, scheduler, db,
+                                              project_dir) -> None:
+        """阶段没跑完（半成品）时不许恢复，否则会把损坏的中间文件当成已完成的。"""
+        import logging
+        job = _add(db, "a.mp4")
+        db.set_stage_result(job.job_id, Stage.REPAIR_VIDEO, StageResult.RUNNING)
+        src = project_dir / "failed" / f"job_{job.job_id:04d}"
+        src.mkdir(parents=True)
+        (src / "video_ai.mp4").write_bytes(b"half")
+        (project_dir / "work" / "current").mkdir(parents=True, exist_ok=True)
+
+        scheduler._restore_quarantine(db.get_job(job.job_id),
+                                      logging.getLogger("test"))
+
+        assert not (project_dir / "work" / "current" / "video_ai.mp4").exists()
+        assert (src / "video_ai.mp4").exists()
+
     def test_stage_done_requires_artifact(self, scheduler, db,
                                           project_dir) -> None:
         """断点续跑不能只看数据库：产物文件缺失时必须重跑该阶段。"""
