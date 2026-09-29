@@ -11,7 +11,7 @@ from profiles.selector import select_profile
 VERIFY_CFG = {"duration_tolerance_seconds": 2.0, "require_video": True,
               "require_audio": True, "min_size_bytes": 1000}
 OUT_CFG = {"container": "mp4", "video_codec": "hevc", "audio_codec": "aac",
-           "sample_rate": 48000, "pix_fmt": "yuv420p"}
+           "sample_rate": 48000, "pix_fmt": "yuv420p", "max_level": "4.1"}
 H264_OUT_CFG = {**OUT_CFG, "video_codec": "h264"}
 
 
@@ -134,6 +134,55 @@ class TestCrossPlatformCompat:
             "/x.mp4") is False
         assert make_verifier(_info(codec_tag="hev1")).matches_target(
             "/x.mp4") is False
+
+
+class TestLevelCeiling:
+    """Level 4.1 上限：实测 2048x1536 会变成 Level 5.0，安卓平板整帧拒解。"""
+
+    def test_h264_level_50_rejected(self) -> None:
+        from pipeline.errors import VerificationError
+        info = _info(video_codec="h264", profile="High", pix_fmt="yuv420p",
+                     codec_tag="avc1", level=50, width=2048, height=1536)
+        with pytest.raises(VerificationError, match="level 超出移动端上限"):
+            make_verifier(info, H264_OUT_CFG).verify_output("/x.mp4", info)
+
+    def test_h264_1080p_level_41_accepted(self) -> None:
+        info = _info(video_codec="h264", profile="High", pix_fmt="yuv420p",
+                     codec_tag="avc1", level=41, width=1920, height=1080)
+        make_verifier(info, H264_OUT_CFG).verify_output("/x.mp4", info)
+
+    def test_hevc_level_normalised_as_well(self) -> None:
+        """HEVC 的 level 是 level×30（4.1 → 123，5.0 → 150），口径要归一。"""
+        from pipeline.errors import VerificationError
+        ok = _info(profile="Main", pix_fmt="yuv420p", codec_tag="hvc1",
+                   level=123, width=1920, height=1080)
+        make_verifier(ok).verify_output("/x.mp4", ok)      # 4.1 → 放行
+        bad = _info(profile="Main", pix_fmt="yuv420p", codec_tag="hvc1",
+                    level=150, width=2048, height=1536)    # 5.0 → 拦下
+        with pytest.raises(VerificationError, match="level 超出移动端上限"):
+            make_verifier(bad).verify_output("/x.mp4", bad)
+
+    def test_max_level_zero_disables_the_check(self) -> None:
+        """只给非移动端交付时可以把 max_level 设为 0 关掉该约束。"""
+        info = _info(video_codec="h264", profile="High", pix_fmt="yuv420p",
+                     codec_tag="avc1", level=50, width=2048, height=1536)
+        make_verifier(info, {**H264_OUT_CFG, "max_level": "0"}).verify_output(
+            "/x.mp4", info)
+
+    def test_oversized_but_unlabelled_frame_rejected(self) -> None:
+        """level 缺失时不漏判：2048x1536 超 H.264 MaxFS，仍要拦下。"""
+        info = _info(video_codec="h264", profile="High", pix_fmt="yuv420p",
+                     codec_tag="avc1", level=41, width=2048, height=1536)
+        from pipeline.errors import VerificationError
+        with pytest.raises(VerificationError, match="分辨率超出 H.264"):
+            make_verifier(info, H264_OUT_CFG).verify_output("/x.mp4", info)
+
+    def test_pipeline_default_1024x768_is_accepted(self) -> None:
+        """本次 37 个课程成片的实际参数：1024x768 / L3.1 / avc1。"""
+        info = _info(video_codec="h264", profile="High", pix_fmt="yuv420p",
+                     codec_tag="avc1", level=31, width=1024, height=768)
+        make_verifier(info, H264_OUT_CFG).verify_output("/x.mp4", info)
+        assert make_verifier(info, H264_OUT_CFG).matches_target("/x.mp4") is True
 
 
 class TestProfileSelector:

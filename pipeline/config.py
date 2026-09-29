@@ -154,6 +154,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "video_codec": "h264",              # h264 | hevc | av1
         # 必须 4:2:0 8bit：4:4:4（yuv444p / HEVC Rext）移动端一律无法解码
         "pix_fmt": "yuv420p",
+        # 移动端安全 level 上限（默认 4.1）。超过它的成片会被安卓/iOS 硬解
+        # **整帧拒解**，VERIFY 会直接判失败。"0" 表示不限制。
+        # 2048x1536 = 12288 宏块/帧 > 4.1 的 MaxFS 8192 → 只能标 L5.0 → 播不了；
+        # 1024x768 = 3072 宏块 → L3.1，正常。详见 pipeline/verifier.py。
+        "max_level": "4.1",
         "audio_codec": "aac",
         "audio_bitrate": "320k",
         "sample_rate": 48000,

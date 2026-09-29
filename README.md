@@ -223,6 +223,7 @@ output:
 | `output.container` | 容器 | `mp4` `mkv` `mov` `webm` `avi` | `mp4` | 改它会自动带上对应编码组合 |
 | `output.video_codec` | 视频编码 | `h264` `hevc` `av1` | `h264` | 手动写时注意与容器匹配；profile / codec tag 会自动配套 |
 | `output.pix_fmt` | 像素格式 | `yuv420p` 等 | `yuv420p` | **别改**。4:4:4 / 10bit 移动端默认播放器一律不支持 |
+| `output.max_level` | 移动端 Level 上限 | `"4.1"` / `"5.0"` / `"0"`(不限) | `"4.1"` | 超过则 VERIFY 判失败。4.1 约等于"最大 1920×1080"，见 [2.5.6](#256-level--分辨率上限第二轮的实机对照) |
 | `output.audio_codec` | 音频编码 | `aac` `mp3` `opus` … | `aac` | webm 要 `opus` |
 | `output.audio_bitrate` | 音频码率 | 如 `128k`/`320k` | `320k` | opus 上限 256k |
 | `output.sample_rate` | 音频采样率 | `44100` / `48000` | `48000` | 源多为 22050Hz，统一升到 48k |
@@ -246,18 +247,19 @@ output:
 #### 2.5.1 背景：一次真实的"格式不支持"
 
 上一轮交付的 MP4 在**安卓平板的默认播放器**里报「格式不支持 / 视频无法播放」，
-而**同片源的 `input/` 文件却能正常播放**。用 ffprobe 对比后确认与分辨率/码率/帧率无关
-（这几项本来都合规），坏在三个编码层参数上：
+而**同片源的 `input/` 文件却能正常播放**。用 ffprobe 对比后确认与码率/帧率无关
+（这两项本来都合规），坏在四个参数上：
 
 | 参数 | `input/`（能播） | 旧版导出（不能播） | 移动端要求 |
 | --- | --- | --- | --- |
 | 视频编码 | h264 `avc1` | **hevc `hev1`** | H.264 必支持；HEVC 必须 **`hvc1`** |
 | Profile | High | **Rext（Range Extensions）** | 只保证 Main / High（8bit） |
 | 像素格式 | yuv420p | **yuv444p** | 只保证 **4:2:0 / 8bit** |
-| 分辨率 / 帧率 / 码率 | 712×400 / 25fps / 650k | 1424×800 / 25fps / 723k | 均合规，**不是原因** |
+| **Level / 分辨率** | **L3.0 / 712×400** | **L5.0 / 1424×800 及 2048×1536** | **只保证 Level ≤ 4.1** |
+| 帧率 / 码率 | 25fps / 650k | 25fps / 723k | 均合规，**不是原因** |
 | 音频 | aac HE-AAC 48k | aac LC 48k | 均合规，**不是原因** |
 
-根因链路（两处叠加）：
+根因链路（三处叠加）：
 
 1. **中间产物的像素格式被带偏成 4:4:4。** RVE 后端补 `-pix_fmt` 的代码写在
    `tools/backend/src/FFmpegBuffers.py` 的 `custom_encoder is None` 分支里；而流水线
@@ -266,14 +268,17 @@ output:
    中间产物变成 `H.264 High 4:4:4 Predictive` → 下游编码器原样继承。
 2. **HEVC 的 codec tag 是 ffmpeg 默认的 `hev1`。** `hev1` 表示参数集放在码流内，
    而大量安卓/iOS 硬件解码器只认 `hvc1`（参数集放进 `hvcC` box），直接拒收。
+3. **分辨率超过 Level 4.1 上限（第二轮实机对照才暴露出来）。** 见 [2.5.6](#256-level--分辨率上限第二轮的实机对照)：
+   仅把编码/tag/像素格式改对**并不足以保证可播**，分辨率本身也会卡死移动端硬解。
 
-代码里对应的三处修复：
+代码里对应的四处修复：
 
 | 位置 | 改动 |
 | --- | --- |
 | `config.yaml` → `video_repair.extra_args` | 给 `--custom_encoder` 补上 `-pix_fmt yuv420p` |
 | `adapters/ffmpeg.py` → `compat_video_args()` | 任何转码都强制 `pix_fmt` + `profile` + `codec tag` |
-| `pipeline/verifier.py` → `compat_problems()` | VERIFY 阶段断言，不合规直接判失败而不出片 |
+| `pipeline/verifier.py` → `compat_problems()` | VERIFY 阶段断言 profile / pix_fmt / tag，不合规不出片 |
+| `adapters/ffmpeg.py` + `pipeline/verifier.py` | **Level 上限判定**：宏块数超 4.1 的 MaxFS（8192）即判失败 |
 
 #### 2.5.2 兼容参数矩阵
 
@@ -286,8 +291,10 @@ output:
 | hevc | `yuv420p` | `main` | **`hvc1`** | 体积省约 40%，但要求设备带 HEVC 硬解 |
 | vp9 / av1 | 由容器决定 | — | — | 走 webm/新容器，播放器支持度另算 |
 
-> `-level` **故意不写死**：让编码器自动取"够用的最低 level"，兼容面反而更广；
-> 写死 4.1 会让 4K 片源因 level 不足而编码失败。
+> `-level` **不写死**：让编码器自动取"够用的最低 level"（1024×768@5fps 会得到 L3.1），
+> 因为写死 4.1 会让高分片源直接编码失败。但"标注正确"≠"设备放得出来"——
+> 分辨率一旦超过 4.1 的 MaxFS，产出必然不可播，所以另由 `output.max_level`
+> 在 VERIFY 阶段兜底拦截（见 [2.5.6](#256-level--分辨率上限第二轮的实机对照)）。
 
 #### 2.5.3 怎么切回 H.265
 
@@ -320,9 +327,10 @@ ffmpeg -y -i "output\xxx.mp4" -c:v libx265 -crf 20 `
 #### 2.5.5 怎么验证一个文件"三端都能播"
 
 ```powershell
-# ① 参数断言：profile 不能是 Rext，pix_fmt 必须是 yuv420p，tag 不能是 hev1
+# ① 参数断言：profile 不能是 Rext，pix_fmt 必须是 yuv420p，tag 不能是 hev1，
+#    level 不能超过 4.1（2048x1536 会变成 5.0 → 移动端拒解）
 ffprobe -v error -select_streams v:0 `
-  -show_entries stream=codec_name,profile,pix_fmt,codec_tag_string `
+  -show_entries stream=codec_name,profile,pix_fmt,codec_tag_string,level,width,height `
   -of default=nw=1 "成片.mp4"
 
 # ② 码流自检：无任何输出即为完整可解
@@ -335,7 +343,38 @@ adb logcat | Select-String "MediaCodec|NuPlayer|OMX"
 ```
 
 预期结果：`codec_name=h264`、`profile=High`、`pix_fmt=yuv420p`、
-`codec_tag_string=avc1`；音频 `aac / LC / 48000 Hz`。
+`codec_tag_string=avc1`、`level <= 41`；音频 `aac / LC / 48000 Hz`。
+
+#### 2.5.6 Level / 分辨率上限（第二轮的实机对照）
+
+**背景**：上一轮只修了编码/tag/像素格式后，`output/课程`（2048×1536，2x AI 超分）
+在安卓平板**仍然报"格式不支持"**。这次做了严格的实机对照实验 —— 同一源、同一套
+编码参数（H.264 High / yuv420p / avc1 / crf23 / AAC 96k），**只差分辨率**：
+
+| 分辨率 | 宏块/帧 | 实际 Level | 平板默认播放器 |
+| --- | --- | --- | --- |
+| 1024×768（源原生） | 64×48 = **3072** | **L3.1** | ✅ 正常播放 |
+| 2048×1536（AI 2x 放大） | 128×96 = **12288** | **L5.0** | ❌ 「格式不支持 / 视频无法播放」 |
+
+**原因**：H.264 的 Level 约束帧大小上限 **MaxFS**。Level 4.1 的 MaxFS = **8192 宏块/帧**；
+2048×1536 是 12288 宏块，塞不进 4.1，x264 只能标成 Level 5.0；而**安卓/iOS 硬解普遍
+封顶 Level 4.1**，于是整帧拒解。
+
+> 这也解释了为什么「1080p 是通用可播上限」：1920×1080 = 120×68 = **8160 宏块**，
+> 恰好压在 8192 以内（这是"历史巧合"，不是 1080 的整数倍关系）。
+
+**三个连带结论**：
+
+1. 原始 HEVC（2048×1536）其实是 **Level 5.0**——所以上一轮我提的"保留分辨率、只改
+   `hev1`→`hvc1`"方案**在这台平板上同样播不了**。分辨率/Level 一直是共因。
+2. `output/课程` 降到 1024×768 反而更贴近 `.wmv` 源的真实内容（2048×1536 是 AI 插值
+   放大出来的细节），不构成"画质损失"。
+3. 1080p 以上想交付移动端，只能改用 HEVC（其 Main profile 对高分辨率有更好的兼容面），
+   或者接受"仅在桌面端可播"。
+
+**代码兜底**：`output.max_level`（默认 `"4.1"`）→ VERIFY 阶段对超出成片**判失败**，
+不再静默出厂。想给纯桌面端交付可设为 `"0"` 关闭（此时 `-level` 仍由编码器自动标注）。
+
 
 ---
 
@@ -508,7 +547,7 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
 
 | 参数 | 作用 | 取值 | 默认 | 推荐 |
 | --- | --- | --- | --- | --- |
-| `output.*` | 见 [2.3](#23-输出相关参数) | — | mp4/h264/aac | 别改 `pix_fmt`，见 [2.5](#25-跨平台播放兼容性windows--android--ios) |
+| `output.*` | 见 [2.3](#23-输出相关参数) | — | mp4/h264/aac/L4.1 | 别改 `pix_fmt` / `max_level`，见 [2.5](#25-跨平台播放兼容性windows--android--ios) |
 | `encoder.prefer` | 编码后端优先级 | 列表 | `["qsv","nvenc","cpu"]` | 保持 |
 | `encoder.qsv_preset` | QSV 速度档 | `fast`~`veryslow` | `medium` | 想快用 `fast` |
 | `encoder.cpu_preset` | CPU 速度档 | `ultrafast`~`veryslow` | `medium` | 想快用 `fast` |
@@ -658,11 +697,12 @@ python main.py run           # 续跑（已完成阶段不会重复执行）
 ### 5.14 现象：成片在安卓 / iPhone 上提示「格式不支持」「视频无法播放」
 
 - **典型特征**：同片源的 `input/` 文件能播，只有 `output/` 的成片不能播。
-- **原因**：这是**编码层**问题，和分辨率/码率/帧率无关。三种可能，用一条 ffprobe 就能定位：
+- **原因**：这是**编码层**问题（含分辨率/Level），和视频码率、帧率、音频无关。
+  四种可能，用一条 ffprobe 就能定位：
 
 ```powershell
 ffprobe -v error -select_streams v:0 `
-  -show_entries stream=codec_name,profile,pix_fmt,codec_tag_string `
+  -show_entries stream=codec_name,profile,pix_fmt,codec_tag_string,level `
   -of default=nw=1 "成片.mp4"
 ```
 
@@ -671,10 +711,12 @@ ffprobe -v error -select_streams v:0 `
 | `pix_fmt=yuv444p`（或 `yuv422p`） | 4:4:4 中间产物泄漏到成片 | 检查 `config.yaml` 的 `video_repair.extra_args` 里 `-pix_fmt yuv420p` 是否还在 |
 | `profile=Rext` | HEVC Range Extensions，同样是 4:4:4 家族 | 同上 |
 | `codec_tag_string=hev1` | HEVC 参数集在码流内，硬件解码器拒收 | 需 `hvc1`；本仓库已在 `compat_video_args()` 自动加 |
+| **`level=50`（或 51）** | **分辨率超过 Level 4.1，移动端整帧拒解** | **降分辨率到 1080p 以内，或改用 HEVC**；见 [2.5.6](#256-level--分辨率上限第二轮的实机对照) |
 | `codec_name=hevc` 而设备较老 | 该机型无 HEVC 硬解 | 把 `output.video_codec` 改为 `h264` 重跑 |
 
-- **注意**：VERIFY 阶段现在会**主动拦截**这三类产物并报
-  `像素格式不兼容移动端` / `HEVC profile 不兼容` / `HEVC codec tag 不兼容`，
+- **注意**：VERIFY 阶段现在会**主动拦截**这几类产物并报
+  `像素格式不兼容移动端` / `HEVC profile 不兼容` / `HEVC codec tag 不兼容` /
+  `编码 level 超出移动端上限` / `分辨率超出 H.264 Level 4.1 上限`，
   所以"跑完且 VERIFY 通过"就说明兼容参数是对的。若历史成片是在该检查加入前出的，
   按 [2.5.4](#254-修复已交付的旧文件无需重跑-ai) 直接重编码补救即可，不必重跑 AI。
 
@@ -829,14 +871,28 @@ ffmpeg -y -i output/剧集/S01E04_seg30min.mp4 `
 
 自检：`ffmpeg -v error -i 成片.mp4 -f null -` 返回码 0、零报错。
 
+**⑥ 二轮返修（Level 上限，见 [2.5.6](#256-level--分辨率上限第二轮的实机对照)）**
+
+首轮返修后，`output/课程`（2048×1536）在平板**仍然播不了**。实机对照证明是
+**分辨率/Level** 共因，而非标签问题：`output/课程` 全部 37 个文件统一
+转成 1024×768（`.wmv` 源原生分辨率）H.264 版本后全部可播。原始 HEVC 成片
+另存为 `录像NN.mp4.hevc-orig.bak`；真实源 `input/课程/*.wmv` 未改动。
+
+| 指标 | 转换前 | 转换后（37 个全量） |
+| --- | --- | --- |
+| 编码 / tag | hevc `hev1`（35 个 Main + 2 个 **Rext/4:4:4**） | **h264 `avc1` / High / yuv420p** |
+| Level | **L5.0**（2048×1536，移动端拒解） | **L3.1**（1024×768） |
+| 体积合计 | 2.42 GB | 约 1.6 GB |
+| 兼容性 | ❌ 平板报"格式不支持" | ✅ 平板默认播放器可播（已实机验证） |
+
 ---
 
 ## 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q     # 当前：102 passed, 3 skipped
+.\.venv\Scripts\python.exe -m pytest tests -q     # 当前：114 passed, 3 skipped
 ```
 
 覆盖：调度器选任务/磁盘约束/失败隔离/断点续跑、内存错误让出队列、隔离产物恢复、
 工具路径兜底、进度与 ETA 计算、校验器、**跨平台兼容参数（pix_fmt / profile /
-hev1→hvc1）**、文件名去重、磁盘管理器。
+hev1→hvc1 / Level 4.1 上限与宏块换算）**、文件名去重、磁盘管理器。

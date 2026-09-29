@@ -143,6 +143,9 @@ class MediaInfo:
     profile: str = ""
     pix_fmt: str = ""
     codec_tag: str = ""
+    # ffprobe 的 level：H.264 是 level_idc（4.1 → 41），HEVC 是 general_level_idc
+    # （4.1 → 123）。口径不同，比较前需用 adapters.ffmpeg.level_tenths 归一。
+    level: int = 0
     width: int = 0
     height: int = 0
     fps: float = 0.0

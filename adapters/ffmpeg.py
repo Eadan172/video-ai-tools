@@ -71,12 +71,66 @@ _BITRATE_LIMIT_KBPS = {"libopus": 256}
 #:   * tag 只对 mp4/mov 有意义：HEVC 必须是 hvc1（参数集进 hvcC box），
 #:     ffmpeg 默认写的 hev1（参数集在码流内）会被大量硬件解码器直接拒收。
 #:   * level 故意不写死：让编码器自动取「够用的最低 level」，反而兼容面更广
-#:     （写死 4.1 会让 4K 片源因 level 不足而编码失败）。
+#:     （写死 4.1 会让高分片源因 level 不足而编码失败）。
+#:     —— 但这条只保证了"标注正确"，不保证"设备放得出来"：分辨率一旦超过
+#:     Level 4.1 的 MaxFS，产出就必然是不可播的，见下方 MOBILE_SAFE_* 与
+#:     pipeline/verifier.py::compat_problems 的兜底判定。
 _COMPAT_VIDEO = {
     "h264": ("high", "avc1"),
     "hevc": ("main", "hvc1"),
     "h265": ("main", "hvc1"),
 }
+
+
+#: 移动端安全上限 —— Level 4.1。
+#:
+#: 为什么是 4.1：安卓/苹果的硬件解码器普遍封顶 Level 4.1；而
+#:   1920x1080 = 120x68 = 8160 宏块，刚好压在 H.264 Level 4.1 的 MaxFS 8192
+#:   以内 —— 这正是「1080p 是通用可播上限」的根本原因。
+#: 实测教训（本仓库真实事故）：2048x1536 = 128x96 = **12288 宏块/帧** > 8192，
+#:   编码器只能标 Level 5.0（x264 会自动取"够用的最低 level"，但该分辨率根本
+#:   塞不进 4.1），安卓平板默认播放器整帧拒解、报「格式不支持」，而同样参数
+#:   降到 1024x768 后正常播放。
+#: 注意：**不能**简单地把 -level 4.1 写死 —— 分辨率超过 MaxFS 时写死 4.1 会
+#:   让编码直接失败。分辨率本身才是根因，故该约束由 verifier 判定。
+MOBILE_SAFE_H264_MBS = 8192          # H.264 Level 4.1 的 MaxFS（宏块/帧）
+#: `output.max_level` 的默认值 —— 即上面这个上限对应的 level 写法
+MOBILE_SAFE_MAX_LEVEL = "4.1"
+
+
+def frame_macroblocks(width: int, height: int) -> int:
+    """按 16x16 宏块切分，返回每帧宏块数（不足一块按一块计）。"""
+    return ((max(0, int(width)) + 15) // 16) * ((max(0, int(height)) + 15) // 16)
+
+
+def level_tenths(codec: str, level: int) -> int:
+    """把 ffprobe 的 level 归一到「十分之一 level」口径，便于跨编码比较。
+
+    H.264 的 level_idc 本身就是 level×10（4.1 → 41）；
+    HEVC 的 general_level_idc 是 level×30（4.1 → 123），故需除以 3。
+    """
+    lv = max(0, int(level or 0))
+    if str(codec).lower() in ("hevc", "h265"):
+        return lv // 3
+    return lv
+
+
+def parse_level(text: object) -> int:
+    """把配置里的 level 写法解析成「十分之一 level」口径。
+
+    "4.1" → 41，"4" → 40，"41" → 41；空/"0" → 0 表示不限制。
+    """
+    s = str(text or "").strip().rstrip("pP").split()[0] if str(text or "").strip() else ""
+    if not s:
+        return 0
+    try:
+        if "." in s:
+            major, minor = s.split(".", 1)
+            return int(major) * 10 + int(minor[0])
+        val = int(float(s))
+        return val if val > 10 else val * 10
+    except (TypeError, ValueError):
+        return 0
 
 
 def compat_video_args(video_codec: str, container: str,

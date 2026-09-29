@@ -246,7 +246,18 @@ audio_repair:
 #        而安卓/iOS 的硬件解码器基本只认 **hvc1**（参数集放进 hvcC box）。
 #     3) 整体从 H.264 换成 HEVC：老款/低端机型根本没有 HEVC 解码器。
 #   → 结论：交付目标应取 Win / Android / iOS 三个默认播放器的**交集**，
-#     即 H.264 High + yuv420p + avc1 + AAC-LC + faststart。
+#     即 H.264 High + yuv420p + avc1 + Level ≤ 4.1 + AAC-LC + faststart。
+#
+# 关于 Level（第二轮实机验证追加的坑，同样勿绕过）：
+#   仅 H.264/H.265 编码对了还不够，**分辨率本身**也会卡死移动端硬解。
+#   实测：同一源、同一套参数，只差分辨率 ——
+#       1024x768  =  64x48  =  3072 宏块/帧 → Level 3.1 → 平板正常播放 ✅
+#       2048x1536 = 128x96  = 12288 宏块/帧 → Level 5.0 → 平板报"格式不支持" ❌
+#   原因：H.264 Level 4.1 的 MaxFS 上限是 8192 宏块/帧，2048x1536 塞不进去，
+#   编码器只能标 Level 5.0；而安卓/iOS 硬解普遍封顶 Level 4.1。
+#   （1920x1080 = 120x68 = 8160 宏块，刚好压线 8192 以内 —— 这就是"1080p 是
+#     通用可播上限"的根本原因。1080p 以上想给移动端，只能改用 HEVC。）
+#   → max_level 就是这条硬约束：VERIFY 会拒绝超过它的成片，不再静默出厂。
 #
 # 想改回 HEVC（体积省约 40%）也可以，但必须 Main + hvc1 + yuv420p；
 # 下面这些字段由 adapters/ffmpeg.py::compat_video_args() 按 video_codec
@@ -257,6 +268,9 @@ output:
   video_codec: "h264"             # h264（三端通吃，默认）| hevc | av1
   pix_fmt: "yuv420p"              # 兼容性硬约束：必须 4:2:0 8bit，
                                   # 4:4:4（yuv444p / HEVC Rext）移动端无法解码
+  max_level: "4.1"                # 移动端安全 level 上限；超过则 VERIFY 判失败。
+                                  # 0 = 不限制（只给非移动端交付时用）。
+                                  # 4.1 对应"最大约 1920x1080"；超 1080p 请改 HEVC。
   audio_codec: "aac"
   audio_bitrate: "320k"
   sample_rate: 48000

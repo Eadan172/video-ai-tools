@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from adapters.ffprobe import FFprobeAdapter
+from adapters.ffmpeg import (MOBILE_SAFE_H264_MBS, MOBILE_SAFE_MAX_LEVEL,
+                             frame_macroblocks, level_tenths, parse_level)
 from pipeline.errors import VerificationError
 from pipeline.state_machine import MediaInfo
 
@@ -49,6 +51,26 @@ class Verifier:
         elif codec == "h264" and info.codec_tag and info.codec_tag != "avc1":
             problems.append(
                 f"H.264 codec tag 不兼容: {info.codec_tag}（需 avc1）")
+
+        # Level / 分辨率上限：超过 Level 4.1 的成片在移动端会被**整帧拒解**。
+        # 实测事故：2048x1536 = 12288 宏块/帧 > 4.1 的 MaxFS 8192，编码器只能标
+        # Level 5.0，安卓平板默认播放器报「格式不支持」；同参数降到 1024x768
+        # （3072 宏块 / L3.1）即正常。这是"能不能播"的硬约束，不是画质偏好。
+        cap = parse_level(self.output_cfg.get("max_level", MOBILE_SAFE_MAX_LEVEL))
+        if codec in ("h264", "avc", "hevc", "h265") and info.level and cap:
+            lv = level_tenths(codec, info.level)
+            if lv > cap:
+                problems.append(
+                    f"编码 level 超出移动端上限: L{lv / 10:.1f} > "
+                    f"L{cap / 10:.1f}（安卓/iOS 硬解普遍封顶 4.1）")
+            elif codec in ("h264", "avc") and info.width and info.height:
+                mbs = frame_macroblocks(info.width, info.height)
+                if mbs > MOBILE_SAFE_H264_MBS:
+                    problems.append(
+                        f"分辨率超出 H.264 Level 4.1 上限: "
+                        f"{info.width}x{info.height} = {mbs} 宏块/帧 > "
+                        f"{MOBILE_SAFE_H264_MBS} 宏块/帧（移动端会拒解；"
+                        "请降分辨率或改用 HEVC）")
         return problems
 
     # ------------------------------------------------------------------ #

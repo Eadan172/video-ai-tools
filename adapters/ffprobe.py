@@ -64,6 +64,11 @@ class FFprobeAdapter:
             info.profile = v.get("profile", "") or ""
             info.pix_fmt = v.get("pix_fmt", "") or ""
             info.codec_tag = v.get("codec_tag_string", "") or ""
+            # level 决定移动端能否解码：超过 Level 4.1 会被整帧拒解
+            try:
+                info.level = int(v.get("level", 0) or 0)
+            except (TypeError, ValueError):
+                info.level = 0
             info.width = int(v.get("width", 0) or 0)
             info.height = int(v.get("height", 0) or 0)
             fps_raw = v.get("avg_frame_rate") or v.get("r_frame_rate") or "0/1"

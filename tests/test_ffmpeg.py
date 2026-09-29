@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from adapters.ffmpeg import (EncoderBackend, FFmpegAdapter, audio_bitrate_for,
-                             compat_video_args, muxer_name)
+from adapters.ffmpeg import (MOBILE_SAFE_H264_MBS, EncoderBackend,
+                             FFmpegAdapter, audio_bitrate_for, compat_video_args,
+                             frame_macroblocks, level_tenths, muxer_name,
+                             parse_level)
 
 
 class TestCompatVideoArgs:
@@ -72,3 +74,39 @@ class TestHelpers:
     def test_audio_bitrate_clamped_for_opus(self) -> None:
         assert audio_bitrate_for("libopus", "320k") == "256k"
         assert audio_bitrate_for("aac", "320k") == "320k"
+
+
+class TestLevelCeiling:
+    """Mobile 端 Level 上限：实测事故见 config.yaml 的 output 段。"""
+
+    def test_1080p_just_fits_level_41(self) -> None:
+        # 1920x1080 = 8160 宏块，压在 Level 4.1 的 MaxFS 8192 以内
+        assert frame_macroblocks(1920, 1080) == 8160
+        assert frame_macroblocks(1920, 1080) <= MOBILE_SAFE_H264_MBS
+
+    def test_2048x1536_exceeds_level_41(self) -> None:
+        # 事故分辨率：12288 宏块 > 8192，编码器只能标 Level 5.0
+        assert frame_macroblocks(2048, 1536) == 12288
+        assert frame_macroblocks(2048, 1536) > MOBILE_SAFE_H264_MBS
+
+    def test_1024x768_is_safe(self) -> None:
+        assert frame_macroblocks(1024, 768) == 3072
+
+    def test_non_multiple_of_16_rounds_up(self) -> None:
+        assert frame_macroblocks(1024, 770) == 64 * 49
+
+    def test_level_tenths_normalises_both_codecs(self) -> None:
+        assert level_tenths("h264", 41) == 41          # level_idc 已是 x10
+        assert level_tenths("hevc", 123) == 41         # general_level_idc 是 x30
+        assert level_tenths("hevc", 150) == 50
+        assert level_tenths("h264", 31) == 31
+
+    def test_parse_level_accepts_common_spellings(self) -> None:
+        assert parse_level("4.1") == 41
+        assert parse_level("4") == 40
+        assert parse_level("41") == 41
+        assert parse_level(4.1) == 41
+        assert parse_level("0") == 0        # 不限制
+        assert parse_level("") == 0
+        assert parse_level(None) == 0
+        assert parse_level("bogus") == 0
