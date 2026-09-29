@@ -88,6 +88,12 @@ video_repair:
   #   full     完全修复：1x 压缩伪影修复 + 2x 超分 + 音质降噪
   # 三档的「修复范围 / 修复深度 / 具体操作」详见：python main.py tiers
   # CLI 覆盖：python main.py --tier standard scan && python main.py --tier standard run
+  #
+  # 注意：CLI 的 --tier standard / full 会把 audio_repair.enabled 一起打开
+  # （见 pipeline/config.py::apply_repair_tier 与 REPAIR_TIERS 的 audio_ai 字段），
+  # 而音频 AI 对本项目素材有害、默认关闭（原因见下方 audio_repair 段）。
+  # 只想「2x 超分 + 不动音频」时，请改这里而不是用 --tier。
+  # （案例附录 E 的片段就是用这里的 standard 跑的；跑完已恢复 auto。）
   tier: "auto"
   backend: "real-video-enhancer"  # real-video-enhancer | none
   infer_backend: "pytorch"        # RVE 推理后端: pytorch | ncnn | tensorrt

@@ -540,6 +540,16 @@ python main.py run           # 续跑（已完成阶段不会重复执行）
   若显示「片源编码 xxx 无压缩伪影特征」，说明 planner 判定不需要 1x 修复（正常）。
 - 想强制完整修复：`--tier full`；想强制只超分：`--tier standard`。
 
+### 5.13 现象：用了 `--tier standard`，音频却被降噪处理了
+
+- **原因**：CLI 的 `--tier standard` / `full` 会按 `REPAIR_TIERS` 的定义把
+  `audio_repair.enabled` **一起置为 `true`**（见 `pipeline/config.py::apply_repair_tier`），
+  而音频 AI 对本项目素材有害（原因见 5.7），默认是关的。
+- **处置**：只想「只超分、不动音频」时，**改 `config.yaml` 的 `video_repair.tier`，
+  不要用 CLI 的 `--tier`**（案例即如此，见 [附录 E](#附录-e-案例s01e04-的-30-分钟片段)）。
+  若已经用 CLI 跑过，音频阶段是独立阶段，把 `audio_repair.enabled` 改回 `false`
+  后重跑会从 `REPAIR_AUDIO` 续跑，不会重做画质 AI。
+
 ---
 
 ## 附录 A 目录结构
@@ -608,6 +618,62 @@ video_pipeline/
 `auto` 的判据两条：① 片源编码/容器是否有压缩伪影特征；② 在
 `总预算 ÷ 队列长度` 得到的单文件预算内跑不跑得起完整档。队列越长 → 单文件预算越小
 → 自动退回快速档，避免做出"要跑好几天"的配置。
+
+---
+
+## 附录 E 案例：S01E04 的 30 分钟片段
+
+本仓库保留了一份**可复现的完整案例**，用于验证链路与对照排查。
+
+**① 源与截取**
+
+```powershell
+# 源：input/剧集/S01E04.mp4（68.1 分钟，712x400 / 25fps / h264 + aac，489.8MB）
+ffmpeg -ss 00:30:00 -t 00:30:00 -i input/剧集/S01E04.mp4 -c copy `
+       -avoid_negative_ts make_zero -movflags +faststart input/剧集/S01E04_seg30min.mp4
+```
+
+产物 `input/剧集/S01E04_seg30min.mp4`：30:04（`-c copy` 按关键帧切，比 30:00 多约 4 秒）、
+151.3MB、712x400 / 25fps。截取放在 `input/` 是为了让流水线把它当成普通源文件。
+
+**② 处理（档位：仅 2x 超分，且不动音频）**
+
+```yaml
+# config.yaml —— 注意用配置档位，而不是 CLI 的 --tier（否则会连带打开音频 AI，见 5.13）
+video_repair:
+  tier: "standard"
+audio_repair:
+  enabled: false
+```
+
+```powershell
+python main.py scan     # 片段入库（本例为 job 45）
+python main.py run      # 无人值守执行
+```
+
+**③ 产物与日志（即本案例留档的三处）**
+
+| 位置 | 内容 |
+| --- | --- |
+| `input/剧集/S01E04_seg30min.mp4` | 截取出的 30 分钟片段（源） |
+| `output/剧集/S01E04_seg30min.mp4` | 处理完成的 30 分钟成片（H.265 + AAC 48kHz） |
+| `logs/jobs/0045.log` | 该任务的 RVE + ffmpeg 全量输出（含调用命令行与每步耗时） |
+| `logs/pipeline.log` | 调度器全景日志（档位决策、阶段切换） |
+| `logs/watchdog.log` | 无人值守守护巡检记录 |
+| `logs/<时间戳>_未导出视频报告.md` | 队列跑空后自动生成的结果报告 |
+
+**④ 实测数据**（本机 22 核 / 16GB / RTX 4060 Laptop 8G）
+
+| 指标 | 值 |
+| --- | --- |
+| 总帧数 | 45100 帧（1804s × 25fps） |
+| REPAIR_VIDEO（仅 2x） | 约 50 分钟（≈15.9 帧/秒，与成本模型预测的 0.7h 一致） |
+| 全链路（含转码/合流/校验） | 约 60 分钟 |
+| RVE 进程峰值内存 | 约 1.0 GB |
+| 编码 ffmpeg 峰值内存 | 约 1.2 GB（`-threads 6`；不加限制会到 1.58GB） |
+
+> 案例视频文件在远端仓库里走 **Git LFS**（见根目录 `.gitattributes`），克隆后若视频显示为
+> 指针文本，执行 `git lfs pull` 即可取回。
 
 ---
 
