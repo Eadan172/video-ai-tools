@@ -62,6 +62,40 @@ _AUDIO_ENCODERS = {"opus": "libopus"}
 _BITRATE_LIMIT_KBPS = {"libopus": 256}
 
 
+#: 目标视频编码 → (profile, MP4 codec tag)。
+#:
+#: 这是「跨平台能不能播」的硬约束表，不是画质偏好：
+#:   * Windows（Media Foundation）/ Android（MediaCodec）/ iOS（QuickTime）的
+#:     默认播放器只保证 H.264 High 与 HEVC Main（8bit 4:2:0）。
+#:   * -profile:v 用来堵住 High 4:4:4 Predictive / HEVC Rext 这类移动端解不了的档位。
+#:   * tag 只对 mp4/mov 有意义：HEVC 必须是 hvc1（参数集进 hvcC box），
+#:     ffmpeg 默认写的 hev1（参数集在码流内）会被大量硬件解码器直接拒收。
+#:   * level 故意不写死：让编码器自动取「够用的最低 level」，反而兼容面更广
+#:     （写死 4.1 会让 4K 片源因 level 不足而编码失败）。
+_COMPAT_VIDEO = {
+    "h264": ("high", "avc1"),
+    "hevc": ("main", "hvc1"),
+    "h265": ("main", "hvc1"),
+}
+
+
+def compat_video_args(video_codec: str, container: str,
+                      pix_fmt: str = "yuv420p") -> list[str]:
+    """返回强制跨平台兼容的视频编码参数（pix_fmt / profile / codec tag）。
+
+    这些参数是「能不能在默认播放器里播」的开关，任何转码路径都应带上，
+    否则中间产物的 4:4:4 会被下游编码器原样继承，成片在移动端直接报
+    "格式不支持"（详见 config.yaml 的 output 段说明）。
+    """
+    args = ["-pix_fmt", str(pix_fmt or "yuv420p")]
+    profile, tag = _COMPAT_VIDEO.get(str(video_codec).lower(), (None, None))
+    if profile:
+        args += ["-profile:v", profile]
+    if tag and str(container).lower() in _FASTSTART_CONTAINERS:
+        args += ["-tag:v", tag]
+    return args
+
+
 def muxer_name(container: str) -> str:
     """把用户可见的容器名翻译成 ffmpeg 的 muxer 名。"""
     key = str(container).lower()
@@ -149,7 +183,9 @@ class FFmpegAdapter:
                               backend: EncoderBackend, audio_codec: str,
                               audio_bitrate: str, sample_rate: int,
                               vf: str | None = None,
-                              container: str | None = None) -> list[str]:
+                              container: str | None = None,
+                              video_codec: str = "hevc",
+                              pix_fmt: str = "yuv420p") -> list[str]:
         crf = str(self.cfg.get("crf", 23))
         container = (container or Path(dst).suffix.lstrip(".") or "mp4").lower()
         args = [self.executable, "-y", "-i", str(src)]
@@ -169,6 +205,11 @@ class FFmpegAdapter:
                 args += ["-crf", crf, "-b:v", "0"]
             else:
                 args += ["-preset", preset, "-crf", crf]
+        # 跨平台兼容硬约束：8bit 4:2:0 + 正确 profile / codec tag。
+        # 不加这一步，上游中间产物的 4:4:4 会被编码器原样继承，成片在
+        # 安卓 / iOS 默认播放器上直接报"格式不支持"（见 compat_video_args）。
+        if video_codec in ("h264", "hevc", "h265"):
+            args += compat_video_args(video_codec, container, pix_fmt)
         enc_a = audio_encoder_name(audio_codec)
         args += ["-c:a", enc_a,
                  "-b:a", audio_bitrate_for(enc_a, audio_bitrate),
@@ -183,7 +224,8 @@ class FFmpegAdapter:
                   sample_rate: int = 48000, backend: EncoderBackend | None = None,
                   timeout: float = 14400, log_file: Path | None = None,
                   vf: str | None = None,
-                  container: str | None = None) -> EncoderBackend:
+                  container: str | None = None,
+                  pix_fmt: str = "yuv420p") -> EncoderBackend:
         """转码到目标格式。
 
         backend=None 时按配置优先级 QSV → NVENC → CPU 逐个尝试：
@@ -192,6 +234,7 @@ class FFmpegAdapter:
 
         :param vf: 可选的视频滤镜链（画质修复用）
         :param container: 目标容器；None 时按 dst 扩展名推断
+        :param pix_fmt: 目标像素格式（兼容性硬约束，默认 yuv420p）
         """
         from pipeline.errors import ExternalToolError
 
@@ -199,7 +242,8 @@ class FFmpegAdapter:
             encoder = _ENCODER_MAP[(video_codec, backend)]
             run_command(self._build_transcode_args(
                 src, dst, encoder, backend, audio_codec, audio_bitrate,
-                sample_rate, vf, container), timeout=timeout, log_file=log_file)
+                sample_rate, vf, container, video_codec, pix_fmt),
+                timeout=timeout, log_file=log_file)
             return backend
 
         encoders = self.list_encoders()
@@ -220,7 +264,8 @@ class FFmpegAdapter:
                 log.info("尝试编码后端 %s (%s)", enc, b.value)
                 run_command(self._build_transcode_args(
                     src, dst, enc, b, audio_codec, audio_bitrate, sample_rate,
-                    vf, container), timeout=timeout, log_file=log_file)
+                    vf, container, video_codec, pix_fmt),
+                    timeout=timeout, log_file=log_file)
                 return b
             except ExternalToolError as exc:
                 log.warning("编码后端 %s 失败，降级尝试下一个: %s", enc, exc)

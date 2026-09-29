@@ -178,12 +178,18 @@ video_repair:
   # 数倍余量（瓶颈在 GPU 推理，不在 CPU 编码），不拖慢整体。
   #
   # 注意：一旦传 --custom_encoder，RVE 就不再拼接预设编码参数，所以这里必须
-  # 写全（视频 + 质量 + 音频 + 字幕）。下面这串与原来的
-  #     "-c:v libx264 -crf 16 -b:a 192k -c:a aac -c:s copy"
-  # 完全等价，只是多了 -threads 6。
+  # 写全（视频 + 质量 + 音频 + 字幕）。
+  #
+  # ！！**-pix_fmt yuv420p 绝对不能省**！！RVE 自己补 -pix_fmt 的那段代码在
+  #     tools/backend/src/FFmpegBuffers.py 的 `custom_encoder is None` 分支里，
+  #     一旦传了 --custom_encoder，RVE 就**不再补 -pix_fmt**（也不补
+  #     -movflags +faststart）。而它的写帧输入是 rawvideo rgb24，ffmpeg 自动
+  #     协商会挑到 **yuv444p** → 中间产物变成 "H.264 High 4:4:4 Predictive" →
+  #     下游 hevc/h264 编码器原样继承 → 最终成片是 4:4:4，安卓/iOS 默认播放器
+  #     直接报"格式不支持"（实测录像04 / 录像06 / S01E04 片段三例就是这么坏掉的）。
   extra_args:
     - "--custom_encoder"
-    - "-c:v libx264 -threads 6 -crf 16 -b:a 192k -c:a aac -c:s copy"
+    - "-c:v libx264 -threads 6 -crf 16 -pix_fmt yuv420p -b:a 192k -c:a aac -c:s copy"
 
 # ===========================================================================
 # 音频处理：默认**关闭 AI 降噪**（保持源声场完整）
@@ -229,11 +235,28 @@ audio_repair:
   extra_args: []
 
 # ---------------------------------------------------------------------------
-# 目标交付格式：MP4 / H.265 / AAC 320k / 48kHz
+# 目标交付格式：MP4 / H.264 / AAC 320k / 48kHz
+#
+# 为什么默认从 H.265 改成 H.264（实测踩坑，勿轻易改回）：
+#   上一轮交付的 MP4 在安卓平板上被默认播放器拒绝（"格式不支持 / 视频无法播放"），
+#   而同片源的 input 文件能正常播放。ffprobe 对比确认三处不兼容：
+#     1) 像素格式被中间产物带偏成 yuv444p，最终写出 HEVC **Rext** profile；
+#        移动端硬解只支持 HEVC Main / 8bit / 4:2:0，4:4:4 一律解不了。
+#     2) HEVC 的 codec tag 是 ffmpeg 默认的 **hev1**（参数集放在码流内），
+#        而安卓/iOS 的硬件解码器基本只认 **hvc1**（参数集放进 hvcC box）。
+#     3) 整体从 H.264 换成 HEVC：老款/低端机型根本没有 HEVC 解码器。
+#   → 结论：交付目标应取 Win / Android / iOS 三个默认播放器的**交集**，
+#     即 H.264 High + yuv420p + avc1 + AAC-LC + faststart。
+#
+# 想改回 HEVC（体积省约 40%）也可以，但必须 Main + hvc1 + yuv420p；
+# 下面这些字段由 adapters/ffmpeg.py::compat_video_args() 按 video_codec
+# 自动配套 profile / codec tag，不需要手工同步，改 video_codec 即可。
 # ---------------------------------------------------------------------------
 output:
   container: "mp4"
-  video_codec: "hevc"             # h264 | hevc | av1
+  video_codec: "h264"             # h264（三端通吃，默认）| hevc | av1
+  pix_fmt: "yuv420p"              # 兼容性硬约束：必须 4:2:0 8bit，
+                                  # 4:4:4（yuv444p / HEVC Rext）移动端无法解码
   audio_codec: "aac"
   audio_bitrate: "320k"
   sample_rate: 48000

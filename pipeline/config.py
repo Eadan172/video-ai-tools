@@ -147,7 +147,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "output": {
         "container": "mp4",
-        "video_codec": "hevc",              # h264 | hevc | av1
+        # 交付目标定为 Windows / Android / iOS 三端默认播放器的**交集**：
+        #   H.264 High + yuv420p + avc1 三端均原生支持，不依赖任何额外解码器。
+        #   改回 hevc 也能跑，但必须是 Main + hvc1；profile / tag / pix_fmt 由
+        #   adapters/ffmpeg.py::compat_video_args() 自动配套，不需要手工同步。
+        "video_codec": "h264",              # h264 | hevc | av1
+        # 必须 4:2:0 8bit：4:4:4（yuv444p / HEVC Rext）移动端一律无法解码
+        "pix_fmt": "yuv420p",
         "audio_codec": "aac",
         "audio_bitrate": "320k",
         "sample_rate": 48000,
@@ -201,7 +207,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
 # `--format` / `output.container` 都会经过 apply_output_format() 归一化。
 # --------------------------------------------------------------------------- #
 CONTAINER_PROFILES: dict[str, dict[str, str]] = {
-    "mp4":  {"video_codec": "hevc", "audio_codec": "aac",  "ext": "mp4",
+    # mp4 是默认交付格式，直接用 H.264：Win / Android / iOS 默认播放器通吃。
+    # （原先写 hevc，实测在安卓平板上因 hev1 + 4:4:4 报"格式不支持"）
+    "mp4":  {"video_codec": "h264", "audio_codec": "aac",  "ext": "mp4",
              "audio_bitrate": "320k"},
     "mkv":  {"video_codec": "hevc", "audio_codec": "aac",  "ext": "mkv",
              "audio_bitrate": "320k"},
@@ -242,7 +250,7 @@ REPAIR_TIERS: dict[str, dict[str, Any]] = {
         "est_hours_per_68min": "约 5 分钟",
         "scope": "全部输入文件；只处理容器与编码，不碰画面/声音内容",
         "depth": "表面：仅重新封装与编码规范化，画质音质与源一致",
-        "steps": "FFmpeg 转码 → H.265/HEVC + AAC 48kHz（QSV→NVENC→CPU 降级）→ 合流 → 校验",
+        "steps": "FFmpeg 转码 → 目标编码 + AAC 48kHz（QSV→NVENC→CPU 降级）→ 合流 → 校验",
     },
     "standard": {
         "label": "中档（2x AI 超分 + 音质降噪）",
@@ -253,7 +261,7 @@ REPAIR_TIERS: dict[str, dict[str, Any]] = {
         "scope": "视频画面（分辨率/锐度）+ 音轨（噪声）；不做压缩伪影修复",
         "depth": "深度：2x 分辨率重建 + 时域/频域降噪，不重建编码损失的细节",
         "steps": "REAL-Video-Enhancer 2x 超分（SPAN 模型，CUDA）→ FFmpeg 抽 48kHz WAV → "
-                 "DeepFilterNet 语音降噪 → HEVC 转码 → 合流 → 校验",
+                 "DeepFilterNet 语音降噪 → FFmpeg 转码 → 合流 → 校验",
     },
     "full": {
         "label": "完全修复（1x 压缩伪影修复 + 2x 超分 + 音质降噪）",
@@ -264,7 +272,7 @@ REPAIR_TIERS: dict[str, dict[str, Any]] = {
         "scope": "视频画面（压缩伪影 + 分辨率/锐度）+ 音轨（噪声），三者全开",
         "depth": "完整重建：先修 H.264/WMV 的块效应与振铃，再重建分辨率，最后降噪",
         "steps": "REAL-Video-Enhancer 1x 去压缩伪影（RealPLKSR）→ 2x 超分（SPAN，CUDA）→ "
-                 "FFmpeg 抽 48kHz WAV → DeepFilterNet 语音降噪 → HEVC 转码 → 合流 → 校验",
+                 "FFmpeg 抽 48kHz WAV → DeepFilterNet 语音降噪 → FFmpeg 转码 → 合流 → 校验",
     },
 }
 

@@ -17,6 +17,41 @@ class Verifier:
         self.output_cfg = output_cfg
 
     # ------------------------------------------------------------------ #
+    def compat_problems(self, info: MediaInfo) -> list[str]:
+        """跨平台播放兼容性检查（Windows / Android / iOS 默认播放器）。
+
+        这些不是画质偏好，而是"能不能播"：
+          * 4:4:4（yuv444p 等）→ 移动端硬解与软解一律不支持，播放器报
+            "格式不支持"；上游中间产物一旦是 4:4:4，会一路继承到成片。
+          * HEVC 的 Rext profile（Range Extensions）同样是 4:4:4 家族。
+          * HEVC 必须用 **hvc1** tag。ffmpeg 默认写 hev1（参数集在码流内），
+            大量安卓/iOS 硬件解码器只认 hvc1（参数集在 hvcC box）而直接拒收。
+
+        字段为空（探测不到）时不判失败，避免对来源不明的文件误报。
+        """
+        if not info.has_video:
+            return []
+        problems: list[str] = []
+        want_pix = str(self.output_cfg.get("pix_fmt", "yuv420p"))
+        if info.pix_fmt and info.pix_fmt != want_pix:
+            problems.append(
+                f"像素格式不兼容移动端: {info.pix_fmt} != {want_pix}"
+                "（4:4:4 / Rext 无法解码）")
+        codec = (info.video_codec or "").lower()
+        if codec in ("hevc", "h265"):
+            if info.profile and info.profile.lower() != "main":
+                problems.append(
+                    f"HEVC profile 不兼容: {info.profile}（需 Main）")
+            if info.codec_tag and info.codec_tag != "hvc1":
+                problems.append(
+                    f"HEVC codec tag 不兼容: {info.codec_tag}（需 hvc1，"
+                    "hev1 会被硬件解码器拒收）")
+        elif codec == "h264" and info.codec_tag and info.codec_tag != "avc1":
+            problems.append(
+                f"H.264 codec tag 不兼容: {info.codec_tag}（需 avc1）")
+        return problems
+
+    # ------------------------------------------------------------------ #
     def verify_output(self, out_path: str, source: MediaInfo) -> MediaInfo:
         """校验最终文件。任何一项不满足 → VerificationError。"""
         info = self.ffprobe.probe(out_path)
@@ -46,6 +81,9 @@ class Verifier:
         want_sr = int(self.output_cfg.get("sample_rate", 48000))
         if self.require_audio and info.sample_rate and info.sample_rate != want_sr:
             problems.append(f"采样率不符合目标: {info.sample_rate} != {want_sr}")
+        # 跨平台播放兼容性（profile / pix_fmt / codec tag）
+        if self.require_video:
+            problems.extend(self.compat_problems(info))
 
         if problems:
             raise VerificationError(f"输出校验失败 {out_path}: " + "; ".join(problems))
@@ -68,4 +106,6 @@ class Verifier:
         v_ok = info.video_codec in codec_alias.get(want_vcodec, {want_vcodec})
         a_ok = (info.audio_codec or "").lower() == want_acodec.lower()
         sr_ok = (not info.has_audio) or info.sample_rate == want_sr
-        return container_ok and v_ok and a_ok and sr_ok
+        # 兼容性也要过：否则会把 AI 中间产物（可能是 yuv444p）直接当成片导出
+        compat_ok = not self.compat_problems(info)
+        return container_ok and v_ok and a_ok and sr_ok and compat_ok

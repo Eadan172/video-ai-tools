@@ -1,7 +1,8 @@
 # Video Pipeline — 单机无人值守批量视频处理系统
 
 把一堆**不规则的老视频**（WMV/AVI/MP4 混合、低分辨率、可能有压缩伪影）自动修复成
-**统一交付格式**（默认 MP4 / H.265 / AAC 48kHz），全程本地、可无人值守、可断点续跑。
+**统一交付格式**（默认 MP4 / H.264 / AAC 48kHz —— Windows、安卓、iOS 的默认播放器
+都能直接打开），全程本地、可无人值守、可断点续跑。
 
 > 设计取向：**稳定性 > 吞吐量**。宁可慢一点、失败隔离得更干净，也不要跑一晚上
 > 早上发现整批卡死或全部报废。
@@ -10,7 +11,7 @@
 | --- | --- |
 | 画质 AI 修复 | REAL-Video-Enhancer 2.4.1：2x 超分（必开）+ 1x 压缩伪影修复（按预算自动决定） |
 | 音频处理 | 默认**不做 AI 降噪**（只重编码，保住源声场）；可开 DeepFilterNet（自动分段防 OOM） |
-| 格式规范化 | 统一容器/编码/采样率，QSV → NVENC → CPU 自动降级 |
+| 格式规范化 | 统一容器/编码/采样率，并强制**跨平台可播参数**（见 [2.5](#25-跨平台播放兼容性windows--android--ios)），QSV → NVENC → CPU 自动降级 |
 | 批量与容错 | 磁盘/内存感知调度、失败隔离、断点续跑、内存耗尽自动跳过并重排 |
 | 无人值守 | 守护脚本自动拉起被杀掉的调度器、终止卡死的 RVE；队列跑空自动出报告 |
 | 进度可视化 | 终端 TUI + 本地 Web 看板（只读，不与调度器争锁） |
@@ -193,11 +194,14 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
 
 | `--format` | 容器 | 视频编码 | 音频编码 | 音频码率 | 适用场景 |
 | --- | --- | --- | --- | --- | --- |
-| `mp4`（默认） | MP4 | H.265/HEVC | AAC | 320k | 通用交付、播放器兼容最好 |
+| `mp4`（默认） | MP4 | **H.264** | AAC | 320k | 通用交付；Windows / 安卓 / iOS 默认播放器通吃 |
 | `mkv` | Matroska | H.265/HEVC | AAC | 320k | 想保留更多音轨/字幕、无 faststart 需求 |
 | `mov` | MOV | H.265/HEVC | AAC | 320k | 进剪辑软件（Premiere/FCP） |
 | `webm` | WebM | VP9 | Opus | **256k** | 网页播放（opus 上限 256k，写 320k 会被 ffmpeg 拒绝） |
 | `avi` | AVI | H.264 | MP3 | 320k | 老播放设备/老编辑软件的兼容兜底 |
+
+> 选 H.265 的分支（mkv / mov）也会被自动补上 `-profile:v main -tag:v hvc1`，
+> 不会产出移动端拒播的 `hev1`。原因与完整参数表见 [2.5](#25-跨平台播放兼容性windows--android--ios)。
 
 ### 2.2 三种指定方式（优先级从高到低）
 
@@ -217,7 +221,8 @@ output:
 | 参数 | 作用 | 取值 | 默认 | 备注 |
 | --- | --- | --- | --- | --- |
 | `output.container` | 容器 | `mp4` `mkv` `mov` `webm` `avi` | `mp4` | 改它会自动带上对应编码组合 |
-| `output.video_codec` | 视频编码 | `h264` `hevc` `av1` | `hevc` | 手动写时注意与容器匹配 |
+| `output.video_codec` | 视频编码 | `h264` `hevc` `av1` | `h264` | 手动写时注意与容器匹配；profile / codec tag 会自动配套 |
+| `output.pix_fmt` | 像素格式 | `yuv420p` 等 | `yuv420p` | **别改**。4:4:4 / 10bit 移动端默认播放器一律不支持 |
 | `output.audio_codec` | 音频编码 | `aac` `mp3` `opus` … | `aac` | webm 要 `opus` |
 | `output.audio_bitrate` | 音频码率 | 如 `128k`/`320k` | `320k` | opus 上限 256k |
 | `output.sample_rate` | 音频采样率 | `44100` / `48000` | `48000` | 源多为 22050Hz，统一升到 48k |
@@ -226,12 +231,111 @@ output:
 
 ### 2.4 编码后端自动降级链
 
-`encoder.prefer: ["qsv","nvenc","cpu"]` → 依次探测 `hevc_qsv` / `hevc_nvenc` /
-`libx265`，**并且运行失败也会继续降级**（编码器存在 ≠ 硬件可用）。想要更快可把
-`cpu_preset` 换成 `fast`/`veryfast`（体积略增），或把 `qsv_preset` 换 `fast`。
+`encoder.prefer: ["qsv","nvenc","cpu"]` → 依次探测**目标编码对应的**硬件编码器
+（默认 h264 时是 `h264_qsv` / `h264_nvenc` / `libx264`），**并且运行失败也会继续降级**
+（编码器存在 ≠ 硬件可用）。想要更快可把 `cpu_preset` 换成 `fast`/`veryfast`（体积略增），
+或把 `qsv_preset` 换 `fast`。
 
 > 小知识：`-movflags +faststart` 只对 mp4/mov 有效，mkv/webm/avi 传了会直接报错，
 > 程序已按容器自动判断。
+
+### 2.5 跨平台播放兼容性（Windows / Android / iOS）
+
+**这一节是「成片能不能在默认播放器里播」的硬约束，不要为了省体积或提高画质绕过它。**
+
+#### 2.5.1 背景：一次真实的"格式不支持"
+
+上一轮交付的 MP4 在**安卓平板的默认播放器**里报「格式不支持 / 视频无法播放」，
+而**同片源的 `input/` 文件却能正常播放**。用 ffprobe 对比后确认与分辨率/码率/帧率无关
+（这几项本来都合规），坏在三个编码层参数上：
+
+| 参数 | `input/`（能播） | 旧版导出（不能播） | 移动端要求 |
+| --- | --- | --- | --- |
+| 视频编码 | h264 `avc1` | **hevc `hev1`** | H.264 必支持；HEVC 必须 **`hvc1`** |
+| Profile | High | **Rext（Range Extensions）** | 只保证 Main / High（8bit） |
+| 像素格式 | yuv420p | **yuv444p** | 只保证 **4:2:0 / 8bit** |
+| 分辨率 / 帧率 / 码率 | 712×400 / 25fps / 650k | 1424×800 / 25fps / 723k | 均合规，**不是原因** |
+| 音频 | aac HE-AAC 48k | aac LC 48k | 均合规，**不是原因** |
+
+根因链路（两处叠加）：
+
+1. **中间产物的像素格式被带偏成 4:4:4。** RVE 后端补 `-pix_fmt` 的代码写在
+   `tools/backend/src/FFmpegBuffers.py` 的 `custom_encoder is None` 分支里；而流水线
+   为了限制 x264 线程内存传了 `--custom_encoder`，导致 RVE **不再补 `-pix_fmt`**。
+   它的写帧输入是 rawvideo `rgb24`，ffmpeg 自动协商挑到了 **yuv444p** →
+   中间产物变成 `H.264 High 4:4:4 Predictive` → 下游编码器原样继承。
+2. **HEVC 的 codec tag 是 ffmpeg 默认的 `hev1`。** `hev1` 表示参数集放在码流内，
+   而大量安卓/iOS 硬件解码器只认 `hvc1`（参数集放进 `hvcC` box），直接拒收。
+
+代码里对应的三处修复：
+
+| 位置 | 改动 |
+| --- | --- |
+| `config.yaml` → `video_repair.extra_args` | 给 `--custom_encoder` 补上 `-pix_fmt yuv420p` |
+| `adapters/ffmpeg.py` → `compat_video_args()` | 任何转码都强制 `pix_fmt` + `profile` + `codec tag` |
+| `pipeline/verifier.py` → `compat_problems()` | VERIFY 阶段断言，不合规直接判失败而不出片 |
+
+#### 2.5.2 兼容参数矩阵
+
+程序会根据 `output.video_codec` **自动配套**下列参数（改 `video_codec` 即可，
+不需要手工同步 profile 或 tag）：
+
+| 目标编码 | `-pix_fmt` | `-profile:v` | MP4 codec tag | 说明 |
+| --- | --- | --- | --- | --- |
+| **h264**（默认） | `yuv420p` | `high` | `avc1` | 三端默认播放器**原生支持**，无需任何额外解码器 |
+| hevc | `yuv420p` | `main` | **`hvc1`** | 体积省约 40%，但要求设备带 HEVC 硬解 |
+| vp9 / av1 | 由容器决定 | — | — | 走 webm/新容器，播放器支持度另算 |
+
+> `-level` **故意不写死**：让编码器自动取"够用的最低 level"，兼容面反而更广；
+> 写死 4.1 会让 4K 片源因 level 不足而编码失败。
+
+#### 2.5.3 怎么切回 H.265
+
+```yaml
+# config.yaml
+output:
+  video_codec: "hevc"    # 只改这一行；profile=main / tag=hvc1 会自动配套
+```
+
+或命令行加 `--format mkv`（mkv 分支默认走 HEVC）。**不要**自己往 ffmpeg 参数里写
+`-tag:v hev1`，也不要关掉 `output.pix_fmt`。
+
+#### 2.5.4 修复已交付的旧文件（无需重跑 AI）
+
+AI 阶段跑一次要几十分钟到几小时，但参数问题只出在**最后一层编码**，
+所以旧成片可以直接重编码补救（4:4:4 → 4:2:0 只影响色度细节，肉眼几乎无差）：
+
+```powershell
+# H.264 版（三端通吃，推荐）
+ffmpeg -y -i "output\剧集\S01E04_seg30min.mp4" `
+  -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -profile:v high `
+  -c:a copy -movflags +faststart "output\剧集\S01E04_seg30min.fixed.mp4"
+
+# 要保留 HEVC 的话：只补 profile + tag + 像素格式
+ffmpeg -y -i "output\xxx.mp4" -c:v libx265 -crf 20 `
+  -pix_fmt yuv420p -profile:v main -tag:v hvc1 `
+  -c:a copy -movflags +faststart "output\xxx.hvc1.mp4"
+```
+
+#### 2.5.5 怎么验证一个文件"三端都能播"
+
+```powershell
+# ① 参数断言：profile 不能是 Rext，pix_fmt 必须是 yuv420p，tag 不能是 hev1
+ffprobe -v error -select_streams v:0 `
+  -show_entries stream=codec_name,profile,pix_fmt,codec_tag_string `
+  -of default=nw=1 "成片.mp4"
+
+# ② 码流自检：无任何输出即为完整可解
+ffmpeg -v error -i "成片.mp4" -f null -
+
+# ③ 真机实测：拷进平板后用**系统默认播放器**打开，确认能起播、能拖进度、能到片尾
+adb push "成片.mp4" /sdcard/Movies/
+# 若被拒，直接看它拒绝了哪个参数：
+adb logcat | Select-String "MediaCodec|NuPlayer|OMX"
+```
+
+预期结果：`codec_name=h264`、`profile=High`、`pix_fmt=yuv420p`、
+`codec_tag_string=avc1`；音频 `aac / LC / 48000 Hz`。
 
 ---
 
@@ -404,7 +508,7 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
 
 | 参数 | 作用 | 取值 | 默认 | 推荐 |
 | --- | --- | --- | --- | --- |
-| `output.*` | 见 [2.3](#23-输出相关参数) | — | mp4/hevc/aac | — |
+| `output.*` | 见 [2.3](#23-输出相关参数) | — | mp4/h264/aac | 别改 `pix_fmt`，见 [2.5](#25-跨平台播放兼容性windows--android--ios) |
 | `encoder.prefer` | 编码后端优先级 | 列表 | `["qsv","nvenc","cpu"]` | 保持 |
 | `encoder.qsv_preset` | QSV 速度档 | `fast`~`veryslow` | `medium` | 想快用 `fast` |
 | `encoder.cpu_preset` | CPU 速度档 | `ultrafast`~`veryslow` | `medium` | 想快用 `fast` |
@@ -511,8 +615,9 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
 
 ### 5.9 现象：`verify` 报某个成片失败
 
-- **原因**：时长偏差超 `duration_tolerance_seconds`、缺视频/音频流、或文件小于
-  `min_size_bytes`（通常是导出中途被杀）。
+- **原因**：时长偏差超 `duration_tolerance_seconds`、缺视频/音频流、文件小于
+  `min_size_bytes`（通常是导出中途被杀），或**跨平台兼容性不达标**（4:4:4 /
+  Rext profile / HEVC 的 `hev1` tag —— 见 [5.14](#514-现象成片在安卓--iphone-上提示格式不支持视频无法播放)）。
 - **处置**：`python main.py retry` 该任务重跑；若反复失败，保留
   `work/current/` 现场并看 `logs\jobs\<id>.log` 尾部的 ffmpeg stderr。
 
@@ -549,6 +654,29 @@ python main.py run           # 续跑（已完成阶段不会重复执行）
   不要用 CLI 的 `--tier`**（案例即如此，见 [附录 E](#附录-e-案例s01e04-的-30-分钟片段)）。
   若已经用 CLI 跑过，音频阶段是独立阶段，把 `audio_repair.enabled` 改回 `false`
   后重跑会从 `REPAIR_AUDIO` 续跑，不会重做画质 AI。
+
+### 5.14 现象：成片在安卓 / iPhone 上提示「格式不支持」「视频无法播放」
+
+- **典型特征**：同片源的 `input/` 文件能播，只有 `output/` 的成片不能播。
+- **原因**：这是**编码层**问题，和分辨率/码率/帧率无关。三种可能，用一条 ffprobe 就能定位：
+
+```powershell
+ffprobe -v error -select_streams v:0 `
+  -show_entries stream=codec_name,profile,pix_fmt,codec_tag_string `
+  -of default=nw=1 "成片.mp4"
+```
+
+| 看到的值 | 含义 | 处置 |
+| --- | --- | --- |
+| `pix_fmt=yuv444p`（或 `yuv422p`） | 4:4:4 中间产物泄漏到成片 | 检查 `config.yaml` 的 `video_repair.extra_args` 里 `-pix_fmt yuv420p` 是否还在 |
+| `profile=Rext` | HEVC Range Extensions，同样是 4:4:4 家族 | 同上 |
+| `codec_tag_string=hev1` | HEVC 参数集在码流内，硬件解码器拒收 | 需 `hvc1`；本仓库已在 `compat_video_args()` 自动加 |
+| `codec_name=hevc` 而设备较老 | 该机型无 HEVC 硬解 | 把 `output.video_codec` 改为 `h264` 重跑 |
+
+- **注意**：VERIFY 阶段现在会**主动拦截**这三类产物并报
+  `像素格式不兼容移动端` / `HEVC profile 不兼容` / `HEVC codec tag 不兼容`，
+  所以"跑完且 VERIFY 通过"就说明兼容参数是对的。若历史成片是在该检查加入前出的，
+  按 [2.5.4](#254-修复已交付的旧文件无需重跑-ai) 直接重编码补救即可，不必重跑 AI。
 
 ---
 
@@ -603,6 +731,7 @@ video_pipeline/
 | 1x 压缩伪影修复（附加） | 1.64 秒/百万输入像素（约为超分的 9 倍） |
 | RVE 进程峰值内存 | 约 1.0~1.4 GB |
 | 编码 ffmpeg 峰值内存 | 1.58 GB（默认线程）→ **1.2 GB（`-threads 6`）** |
+| 转码（H.264，CPU libx264 medium，**默认**） | 约 6.8x 实时（1424×800 → 170 fps，22 核） |
 | 转码（HEVC，CPU libx265 medium） | 约 1/3 ~ 1/4 实时 |
 | 一次完整单文件链路（1024×768 / 40 分钟 / 仅 2x） | 约 35 ~ 45 分钟 |
 
@@ -656,7 +785,7 @@ python main.py run      # 无人值守执行
 | 位置 | 内容 |
 | --- | --- |
 | `input/剧集/S01E04_seg30min.mp4` | 截取出的 30 分钟片段（源） |
-| `output/剧集/S01E04_seg30min.mp4` | 处理完成的 30 分钟成片（H.265 + AAC 48kHz） |
+| `output/剧集/S01E04_seg30min.mp4` | 处理完成的 30 分钟成片（H.264 High + AAC 48kHz，跨平台可播） |
 | `logs/jobs/0045.log` | 该任务的 RVE + ffmpeg 全量输出（含调用命令行与每步耗时） |
 | `logs/pipeline.log` | 调度器全景日志（档位决策、阶段切换） |
 | `logs/watchdog.log` | 无人值守守护巡检记录 |
@@ -675,13 +804,39 @@ python main.py run      # 无人值守执行
 > 案例视频文件在远端仓库里走 **Git LFS**（见根目录 `.gitattributes`），克隆后若视频显示为
 > 指针文本，执行 `git lfs pull` 即可取回。
 
+**⑤ 兼容性返修记录**（本案例就是第 2.5 节事故的现场）
+
+本案例最初产出的成片是 `HEVC Rext / yuv444p / hev1`，在安卓平板上无法播放。
+参数问题只出在最后一层编码，因此**没有重跑 AI**，直接重编码补救：
+
+```powershell
+ffmpeg -y -i output/剧集/S01E04_seg30min.mp4 `
+  -c:v libx264 -preset medium -crf 18 -profile:v high -pix_fmt yuv420p `
+  -c:a copy -movflags +faststart output/剧集/S01E04_seg30min.fixed.mp4
+```
+
+修复前后（均为 ffprobe 实测）：
+
+| 参数 | 修复前（不能播） | 修复后（三端可播） |
+| --- | --- | --- |
+| 视频编码 / tag | hevc `hev1` | **h264 `avc1`** |
+| Profile | **Rext** | **High** |
+| 像素格式 | **yuv444p** | **yuv420p** |
+| 音频 | aac LC 48kHz 立体声 | aac LC 48kHz 立体声（`-c:a copy` 未动） |
+| 时长 | 1803.946 s | 1803.946 s（帧级一致） |
+| 体积 | 215.3 MB | 533.6 MB（crf 18 画质优先；流水线默认 crf 23 约 340 MB） |
+| moov 位置 | 无 faststart | 前置（offset 36） |
+
+自检：`ffmpeg -v error -i 成片.mp4 -f null -` 返回码 0、零报错。
+
 ---
 
 ## 测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q     # 当前：85 passed, 3 skipped
+.\.venv\Scripts\python.exe -m pytest tests -q     # 当前：102 passed, 3 skipped
 ```
 
 覆盖：调度器选任务/磁盘约束/失败隔离/断点续跑、内存错误让出队列、隔离产物恢复、
-工具路径兜底、进度与 ETA 计算、校验器、文件名去重、磁盘管理器。
+工具路径兜底、进度与 ETA 计算、校验器、**跨平台兼容参数（pix_fmt / profile /
+hev1→hvc1）**、文件名去重、磁盘管理器。

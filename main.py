@@ -129,12 +129,14 @@ def cmd_status(args) -> int:
         print("RTX VRAM         : 未检测到（无 NVIDIA GPU 或 nvidia-smi）")
     try:
         encoders = ffmpeg.list_encoders()
-        qsv = "READY" if "hevc_qsv" in encoders else "NOT AVAILABLE"
+        want = str(cfg.output.get("video_codec", "h264"))
+        qsv = "READY" if f"{want}_qsv" in encoders else "NOT AVAILABLE"
     except Exception:  # noqa: BLE001
         qsv = "UNKNOWN (ffmpeg 不可用)"
     print(f"Intel QSV        : {qsv}")
     print(f"Output Format    : .{cfg.output_ext}  "
-          f"({cfg.output.get('video_codec')} + {cfg.output.get('audio_codec')})")
+          f"({cfg.output.get('video_codec')} + {cfg.output.get('audio_codec')})"
+          f"  pix_fmt={cfg.output.get('pix_fmt', 'yuv420p')}")
     tier = str(cfg.video_repair.get("tier") or "auto")
     print(f"Repair Tier      : {tier}  "
           f"({REPAIR_TIERS.get(tier, {}).get('summary', '')})")
@@ -348,9 +350,11 @@ def cmd_doctor(args) -> int:
     if ffmpeg.available():
         try:
             encoders = ffmpeg.list_encoders()
-            check("NVIDIA NVENC", "hevc_nvenc" in encoders)
-            check("Intel QSV", "hevc_qsv" in encoders)
-            check("CPU libx265", "libx265" in encoders)
+            want = str(cfg.output.get("video_codec", "h264"))
+            check("NVIDIA NVENC", f"{want}_nvenc" in encoders)
+            check("Intel QSV", f"{want}_qsv" in encoders)
+            check("CPU 软编", f"lib{'x265' if want == 'hevc' else 'x264'}"
+                  in encoders)
         except Exception as exc:  # noqa: BLE001
             check("编码器检测", False, str(exc))
 

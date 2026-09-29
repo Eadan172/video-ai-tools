@@ -60,6 +60,10 @@ class FFprobeAdapter:
         if vstreams:
             v = vstreams[0]
             info.video_codec = v.get("codec_name", "")
+            # 兼容性三要素：用于判断成片能否在 Win/Android/iOS 默认播放器里播
+            info.profile = v.get("profile", "") or ""
+            info.pix_fmt = v.get("pix_fmt", "") or ""
+            info.codec_tag = v.get("codec_tag_string", "") or ""
             info.width = int(v.get("width", 0) or 0)
             info.height = int(v.get("height", 0) or 0)
             fps_raw = v.get("avg_frame_rate") or v.get("r_frame_rate") or "0/1"

@@ -136,6 +136,13 @@ class MediaInfo:
     bitrate: int = 0
     size: int = 0
     video_codec: str = ""
+    # 跨平台播放兼容性三要素（缺一则移动端默认播放器可能拒播）：
+    #   profile   —— 堵住 H.264 High 4:4:4 Predictive / HEVC Rext
+    #   pix_fmt   —— 必须是 yuv420p（8bit 4:2:0）
+    #   codec_tag —— HEVC 需 hvc1（ffmpeg 默认的 hev1 会被硬件解码器拒收）
+    profile: str = ""
+    pix_fmt: str = ""
+    codec_tag: str = ""
     width: int = 0
     height: int = 0
     fps: float = 0.0

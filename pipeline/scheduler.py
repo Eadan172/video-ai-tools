@@ -318,6 +318,7 @@ class Scheduler:
         self.ffmpeg.transcode(Path(job.source_path), video_ai,
                               video_codec=out.get("video_codec", "hevc"),
                               sample_rate=out.get("sample_rate", 48000),
+                              pix_fmt=out.get("pix_fmt", "yuv420p"),
                               log_file=log_file)
 
     def _plan_repair(self, info: MediaInfo, profile: Profile, jlog):
@@ -412,6 +413,7 @@ class Scheduler:
             audio_codec=out_cfg.get("audio_codec", "aac"),
             audio_bitrate=out_cfg.get("audio_bitrate", "320k"),
             sample_rate=int(out_cfg.get("sample_rate", 48000)),
+            pix_fmt=out_cfg.get("pix_fmt", "yuv420p"),
             log_file=log_file)
         self.db.set_stage_result(job.job_id, stage, StageResult.DONE)
         jlog.info("%s 完成 → %s", stage.value, transcoded.name)

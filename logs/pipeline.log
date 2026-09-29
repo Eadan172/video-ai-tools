@@ -3525,3 +3525,7 @@ PermissionError: [WinError 32] 另一个程序正在使用此文件，进程无�
 2026-09-29 08:32:23,852 [INFO] pipeline.runner: EXIT rc=0 0.1s E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.EXE
 2026-09-29 08:32:23,862 [INFO] pipeline.runner: RUN E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.EXE -v error -print_format json -show_format -show_streams E:\WorkBuddy\video-transfer-tools\video_pipeline\output\课程\录像37.mp4
 2026-09-29 08:32:23,929 [INFO] pipeline.runner: EXIT rc=0 0.0s E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.EXE
+2026-09-29 13:17:00,681 [INFO] pipeline.runner: RUN E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.exe -v error -print_format json -show_format -show_streams E:\WorkBuddy\video-transfer-tools\video_pipeline\output\剧集\S01E04.mp4
+2026-09-29 13:17:00,744 [INFO] pipeline.runner: EXIT rc=0 0.1s E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.exe
+2026-09-29 13:17:00,755 [INFO] pipeline.runner: RUN E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.exe -v error -print_format json -show_format -show_streams E:\WorkBuddy\video-transfer-tools\video_pipeline\output\剧集\S01E04_seg30min.mp4
+2026-09-29 13:17:00,812 [INFO] pipeline.runner: EXIT rc=0 0.0s E:\WorkBuddy\video-transfer-tools\video_pipeline\.tools\ffmpeg\ffprobe.exe
