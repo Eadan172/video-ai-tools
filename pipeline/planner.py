@@ -15,7 +15,7 @@
 
 成本模型
 --------
-按「单帧成本可分解」标定（本机 RTX 4060 Laptop 8GB + CUDA + tile=0）：
+按「单帧成本可分解」标定（参考环境：8GB 显存笔记本独显 / CUDA / tile=0）：
 
     秒/帧 = upscale_s_per_mp    × 输出百万像素     （2x 超分）
           + decompress_s_per_mp × 输入百万像素     （1x 压缩修复）

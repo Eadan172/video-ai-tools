@@ -15,7 +15,7 @@
    当组内任一占位符解析为空字符串时，**整组被丢弃**——用于“未配置 4x 模型
    则不传 `--upscale_model`”这类场景，避免产生非法参数。
 5. 工具不存在时流水线仍可启动：`doctor` 给 WARN，调度器抛 DependencyError。
-6. 默认不插帧；RTX 4060 为唯一 AI 视频 GPU，并发 = 1（由 scheduler 保证）。
+6. 默认不插帧；同一时间只使用一块 AI 视频 GPU，并发 = 1（由 scheduler 保证）。
 """
 
 from __future__ import annotations

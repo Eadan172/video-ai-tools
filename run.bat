@@ -11,7 +11,7 @@ rem  Just double-click this file, or run with options:
 rem      run.bat --format mkv             output mkv instead of mp4
 rem      run.bat --only <subdir>          only process input\<subdir>
 rem      run.bat --dry-run                check environment only
-rem      run.bat --selftest               run the test suite
+rem      run.bat --selftest               tests removed; prints a note and exits
 rem      run.bat --no-prompt --format mp4 unattended, no questions
 rem      run.bat --no-ai                  skip AI repair, transcode only
 rem ===================================================================

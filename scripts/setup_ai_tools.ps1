@@ -77,7 +77,7 @@ Set-Location $Root
 #               torchaudio 的 C++ 算子注册正常（见 §torchaudio 混装说明）。
 #   * .venv-rve (REAL-Video-Enhancer) 跟随 RVE 官方 tools/backend/requirements.txt：
 #               torch==2.7.0 / torchvision==0.22.0。CUDA 构建选 cu128，
-#               对应 NVIDIA 驱动 >= 570（本机 572.83，最高支持 CUDA 12.8）。
+#               对应 NVIDIA 驱动 >= 570（cu128 对应 CUDA 12.8）。
 #               若显存/驱动较旧，可改 -CudaIndex cu126 或 cu118。
 # --------------------------------------------------------------------------- #
 $TORCH_VER_DF  = "2.5.1"    # DeepFilterNet 侧
@@ -115,11 +115,6 @@ function Get-Python {
         if ($c) { return $c.Source }
     }
     $cands = @()
-    if ($env:USERPROFILE) {
-        $cands += Get-ChildItem `
-            "$env:USERPROFILE\.workbuddy\binaries\python\versions\*\python.exe" `
-            -ErrorAction SilentlyContinue
-    }
     if ($env:LOCALAPPDATA) {
         $cands += Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" `
             -ErrorAction SilentlyContinue
@@ -160,8 +155,8 @@ New-Venv ".venv"     $PY
 New-Venv ".venv-rve" $PY
 
 # --------------------------------------------------------------------------- #
-Step "2/6 安装流水线运行时依赖 (PyYAML / psutil / pytest)"
-Pip ".venv" @("PyYAML>=6.0", "psutil>=5.9", "pytest>=7.4")
+Step "2/6 安装流水线运行时依赖 (PyYAML / psutil)"
+Pip ".venv" @("PyYAML>=6.0", "psutil>=5.9")
 
 # --------------------------------------------------------------------------- #
 Step "3/6 安装 DeepFilterNet ($DF_VER) 及其运行时"
