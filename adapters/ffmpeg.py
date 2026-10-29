@@ -26,7 +26,7 @@ class EncoderBackend(enum.Enum):
 
 
 #: (目标 codec, 后端) -> ffmpeg encoder 名
-#: 表中存在但本机 ffmpeg 未编译的编码器会被 select_encoder / transcode 自动跳过
+#: 表中存在但当前环境的 ffmpeg 未编译的编码器会被 select_encoder / transcode 自动跳过
 _ENCODER_MAP = {
     ("hevc", EncoderBackend.QSV): "hevc_qsv",
     ("hevc", EncoderBackend.NVENC): "hevc_nvenc",

@@ -1,4 +1,4 @@
 # Python 依赖（FFmpeg / REAL-Video-Enhancer / DeepFilterNet 为外部工具，见 README）
+# 单元测试已按所有者要求移除，运行工具不需要 pytest。
 PyYAML>=6.0
 psutil>=5.9
-pytest>=7.4

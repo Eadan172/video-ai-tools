@@ -378,13 +378,9 @@ if ($DryRun) {
 }
 
 if ($SelfTest) {
-    Step "6/6  自测（pytest）"
-    $ErrorActionPreference = "Continue"
-    & $VenvPy -m pytest (Join-Path $Root "tests") -q --no-header
-    $rc = $LASTEXITCODE
-    $ErrorActionPreference = "Stop"
-    if ($rc -ne 0) { Fail "自测未通过（退出码 $rc）"; exit $rc }
-    Ok "自测通过"
+    Step "6/6  自测"
+    Warn "单元测试（tests/test_*.py）已按所有者要求从仓库移除，运行工具不依赖它们。"
+    Ok "跳过 pytest"
     exit 0
 }
 

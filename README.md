@@ -46,7 +46,7 @@
 | 磁盘 | 30 GB | 50 GB+ | 源大小 × 1.5 + 成片；阈值见 [参数表](#4-全部可修改参数) |
 | FFmpeg | 必需 | 仓库自带即可 | `scripts/bootstrap.ps1` 会自动下载到 `.tools\ffmpeg\` |
 
-> **内存是这台机器的第一约束**：AI 阶段（RVE 推理 + 它自己拉起的编码 ffmpeg）实测
+> **内存是第一约束**：AI 阶段（RVE 推理 + 它自己拉起的编码 ffmpeg）实测
 > 峰值 2.3 GB 左右，若机器同时跑着浏览器/IDE，可用内存不足时会以
 > 「`Unable to allocate 2.25 MiB`」的形式崩在 RVE 的读帧线程里。详见
 > [5.2 内存耗尽](#52-现象-rve-报-unable-to-allocate-225-mib-或-memoryerror)。
@@ -157,7 +157,8 @@ flowchart TD
 
 ```powershell
 # 启动守护（必须用 WMI，见下方注意）
-$root = "E:\WorkBuddy\video-transfer-tools\video_pipeline"
+# 在仓库根目录执行。若当前目录不是仓库，把 $root 设为 <repo-root>。
+$root = (Resolve-Path .).Path
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
   CommandLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$root\scripts\watchdog_pipeline.ps1`""
   CurrentDirectory = $root }
@@ -391,7 +392,7 @@ adb logcat | Select-String "MediaCodec|NuPlayer|OMX"
 RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) + 600)
 ```
 
-默认标定值（**RTX 4060 Laptop 8G / CUDA / tile=0** 上实测）：
+默认标定值（**参考环境：8GB 显存笔记本独显 / CUDA / tile=0**）：
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -399,7 +400,7 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
 | `decompress_s_per_mp` | `1.64` | 每百万**输入**像素的压缩修复耗时（秒）——比超分贵约 35 倍 |
 | `job_overhead_seconds` | `30` | 模型加载等固定开销 |
 
-**算一遍就懂了**（本机实测吻合）：
+**算一遍就懂了**（与参考环境的计时吻合）：
 
 | 片源 | 档位 | 计算 | 预计 | 实测 |
 | --- | --- | --- | --- | --- |
@@ -433,13 +434,13 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
    ```
    输出含：总时长、单文件预算、完整档/快速档预估小时数、逐文件档位与理由。
 
-### 3.3 不同设备的粗略倍率（以本机 4060 Laptop 为 1×）
+### 3.3 不同设备的粗略倍率（以 8GB 显存笔记本独显为 1×）
 
 | 设备档位 | 相对速度 | 68 分钟 712×400 片源（仅 2x） | 建议 |
 | --- | --- | --- | --- |
 | RTX 4090 / 4080 台式 | 2.5 ~ 3.5× | 30 ~ 40 分钟 | 可考虑 4x 模型 |
 | RTX 4070 / 4060 台式 | 1.4 ~ 2× | 45 ~ 65 分钟 | 默认档位即可 |
-| **RTX 4060 Laptop（本机）** | **1×** | **约 1.5 小时** | 默认档位；`tile=512` 更稳 |
+| **8GB 显存笔记本独显（参考基准）** | **1×** | **约 1.5 小时** | 默认档位；`tile=512` 更稳 |
 | GTX 1660 / 6G | 0.4 ~ 0.6× | 2.5 ~ 4 小时 | 关掉 1x 修复，只用 2x |
 | 纯 CPU（无独显） | 0.03 ~ 0.05× | 2 ~ 3 天 | 只用 `--tier light` 或 `--no-ai` |
 | Apple Silicon（M 系，MPS） | 0.3 ~ 0.6× | 3 ~ 5 小时 | 需 `device: mps` |
@@ -461,7 +462,7 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
 ## 4. 全部可修改参数
 
 > 全部写在 `config.yaml`；以 `./` 开头的路径**相对配置文件所在目录**解析。
-> 「推荐」列是本机 16GB / 8GB 显存 / 50GB 磁盘下的建议值。
+> 「推荐」列按示例环境给出：16GB 内存 / 8GB 显存 / 50GB 磁盘。请按实际机器改 `cpu_cores` 与 `ram_total_gb`。
 
 ### 4.1 路径与资源
 
@@ -598,8 +599,8 @@ RVE 超时 = max(timeout_floor_seconds, 估计值 × timeout_safety_factor(3.0) 
 - **根因**：**整机内存耗尽**（不是显存、也不是"无限缓存"——读队列本身有界
   `Queue(maxsize=25)`）。RVE 读帧线程连 2.25 MB 都申请不到；线程一死，后端就报
   "FFmpeg failed to render the video" 并以 rc=1 / 0xC0000005 退出。
-- **放大因素**：RVE 自己拉起的编码 ffmpeg 默认**不限制帧线程数**（按核数自动，本机
-  22 核），实测峰值 1.58 GB，是整条流水线里最大、也是唯一可调的内存开销。
+- **放大因素**：RVE 自己拉起的编码 ffmpeg 默认**不限制帧线程数**（按逻辑处理器数量自动开满），
+  实测峰值 1.58 GB，是整条流水线里最大、也是唯一可调的内存开销。
 - **已内置的处置**（三层，无需你手工干预）：
   1. 降到 `tile: 512` 分块推理；
   2. `extra_args` 里限制编码线程 `-threads 6`（峰值 1.58 → 1.2 GB）；
@@ -743,11 +744,10 @@ video_pipeline/
 │   └─ verifier.py         成片 ffprobe 校验
 ├─ adapters/               RVE / FFmpeg / FFprobe / DeepFilterNet 适配器
 ├─ profiles/               按分辨率的处理策略
-├─ tests/                  pytest 用例（当前 85 passed / 3 skipped）
-├─ input/[课程|剧集]/       源视频（只读）
-├─ output/[课程|剧集]/      成片（镜像输入子目录）
+├─ input/[课程|剧集]/       源视频（只读；示例片段走 Git LFS，其余运行输入不入库）
+├─ output/[课程|剧集]/      成片（镜像输入子目录；示例成片走 Git LFS）
 ├─ failed/job_XXXX/        失败隔离的中间产物
-├─ logs/                   运行日志、守护日志、未导出报告
+├─ logs/                   运行日志（本地生成，已 gitignore，不要提交）
 ├─ work/current/           单任务工作区（同一时间只服务一个视频）
 └─ .tools/ffmpeg/          仓库自带 FFmpeg/FFprobe
 ```
@@ -766,14 +766,14 @@ video_pipeline/
 
 ## 附录 C 实测性能基准
 
-| 项目 | 实测值（本机：22 核 / 16GB / RTX 4060 Laptop 8G） |
+| 项目 | 参考值（16GB 内存 / 8GB 显存独显 / CUDA） |
 | --- | --- |
 | 2x 超分（712×400→1424×800） | 0.053 秒/帧（≈19 帧/秒） |
 | 2x 超分（1024×768→2048×1536） | 0.146 秒/帧（≈6.8 帧/秒） |
 | 1x 压缩伪影修复（附加） | 1.64 秒/百万输入像素（约为超分的 9 倍） |
 | RVE 进程峰值内存 | 约 1.0~1.4 GB |
 | 编码 ffmpeg 峰值内存 | 1.58 GB（默认线程）→ **1.2 GB（`-threads 6`）** |
-| 转码（H.264，CPU libx264 medium，**默认**） | 约 6.8x 实时（1424×800 → 170 fps，22 核） |
+| 转码（H.264，CPU libx264 medium，**默认**） | 约 6.8x 实时（1424×800 → 170 fps，多核 CPU） |
 | 转码（HEVC，CPU libx265 medium） | 约 1/3 ~ 1/4 实时 |
 | 一次完整单文件链路（1024×768 / 40 分钟 / 仅 2x） | 约 35 ~ 45 分钟 |
 
@@ -822,18 +822,20 @@ python main.py scan     # 片段入库（本例为 job 45）
 python main.py run      # 无人值守执行
 ```
 
-**③ 产物与日志（即本案例留档的三处）**
+**③ 产物与日志**
+
+示例片段与成片随仓库走 Git LFS。运行日志写在 `logs/`，已被 `.gitignore` 排除，克隆后不会带上历史任务输出。
 
 | 位置 | 内容 |
 | --- | --- |
-| `input/剧集/S01E04_seg30min.mp4` | 截取出的 30 分钟片段（源） |
-| `output/剧集/S01E04_seg30min.mp4` | 处理完成的 30 分钟成片（H.264 High + AAC 48kHz，跨平台可播） |
-| `logs/jobs/0045.log` | 该任务的 RVE + ffmpeg 全量输出（含调用命令行与每步耗时） |
-| `logs/pipeline.log` | 调度器全景日志（档位决策、阶段切换） |
-| `logs/watchdog.log` | 无人值守守护巡检记录 |
-| `logs/<时间戳>_未导出视频报告.md` | 队列跑空后自动生成的结果报告 |
+| `input/剧集/S01E04_seg30min.mp4` | 截取出的 30 分钟片段（源，Git LFS） |
+| `output/剧集/S01E04_seg30min.mp4` | 处理完成的 30 分钟成片（H.264 High + AAC 48kHz，跨平台可播，Git LFS） |
+| `logs/jobs/<id>.log` | 该任务的 RVE + ffmpeg 全量输出（运行时生成，不入库） |
+| `logs/pipeline.log` | 调度器全景日志（运行时生成，不入库） |
+| `logs/watchdog.log` | 无人值守守护巡检记录（运行时生成，不入库） |
+| `logs/<时间戳>_未导出视频报告.md` | 队列跑空后自动生成的结果报告（运行时生成，不入库） |
 
-**④ 实测数据**（本机 22 核 / 16GB / RTX 4060 Laptop 8G）
+**④ 实测数据**（参考环境：16GB 内存 / 8GB 显存独显 / CUDA）
 
 | 指标 | 值 |
 | --- | --- |
@@ -889,10 +891,5 @@ ffmpeg -y -i output/剧集/S01E04_seg30min.mp4 `
 
 ## 测试
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q     # 当前：114 passed, 3 skipped
-```
-
-覆盖：调度器选任务/磁盘约束/失败隔离/断点续跑、内存错误让出队列、隔离产物恢复、
-工具路径兜底、进度与 ETA 计算、校验器、**跨平台兼容参数（pix_fmt / profile /
-hev1→hvc1 / Level 4.1 上限与宏块换算）**、文件名去重、磁盘管理器。
+`tests/test_*.py` 与 `tests/conftest.py` 已按所有者要求从公开仓库移除，运行工具不依赖它们。
+`run.bat --selftest` 只会提示这一点并退出。可选的手工批测脚本 `scripts/e2e_batch_test.py` 仍保留，不属于启动流水线的必需文件。
